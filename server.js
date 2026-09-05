@@ -13,37 +13,38 @@ const pool = new Pool({
     ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
-// Database Migration & Schema Fixes
+// Database Safe Migration
 const initDb = async () => {
     try {
+        // Table reset karega agar purana strict schema hai
         await pool.query(`
             CREATE TABLE IF NOT EXISTS withdrawals (
                 id VARCHAR(255) PRIMARY KEY,
-                user_id VARCHAR(255),
                 binance_id VARCHAR(255),
                 amount NUMERIC NOT NULL,
-                type VARCHAR(50) DEFAULT 'Binance',
                 status VARCHAR(50) DEFAULT 'Pending',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
 
-        // Fix Constraints: Make user_id, type & binance_id optional (Allow NULL)
+        // Purane sabhi columns ke Strict NOT NULL constraints ko Hata dega
         await pool.query(`
             ALTER TABLE withdrawals 
-            ADD COLUMN IF NOT EXISTS user_id VARCHAR(255),
             ADD COLUMN IF NOT EXISTS binance_id VARCHAR(255),
+            ADD COLUMN IF NOT EXISTS wallet VARCHAR(255),
+            ADD COLUMN IF NOT EXISTS user_id VARCHAR(255),
             ADD COLUMN IF NOT EXISTS type VARCHAR(50) DEFAULT 'Binance',
             ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 
             ALTER TABLE withdrawals ALTER COLUMN user_id DROP NOT NULL;
             ALTER TABLE withdrawals ALTER COLUMN type DROP NOT NULL;
             ALTER TABLE withdrawals ALTER COLUMN binance_id DROP NOT NULL;
+            ALTER TABLE withdrawals ALTER COLUMN wallet DROP NOT NULL;
         `);
 
-        console.log("Database schema updated: type and user_id constraints fixed!");
+        console.log("SUCCESS: Database schema completely cleaned and updated!");
     } catch (err) {
-        console.error("Database schema error:", err.message);
+        console.error("Database initialization error:", err.message);
     }
 };
 
@@ -55,7 +56,7 @@ app.get('/', (req, res) => {
 
 // Submit Withdrawal
 app.post('/api/withdraw', async (req, res) => {
-    const { binanceId, amount, userId, type } = req.body;
+    const { binanceId, amount, userId, wallet, type } = req.body;
 
     if (!binanceId || !amount || amount < 1000) {
         return res.status(400).json({ success: false, message: "Invalid Request Data" });
@@ -63,16 +64,17 @@ app.post('/api/withdraw', async (req, res) => {
 
     const id = Date.now().toString();
     const finalUserId = userId || req.body.user_id || 'N/A';
+    const finalWallet = wallet || req.body.wallet || binanceId;
     const finalType = type || req.body.type || 'Binance';
 
     try {
         const query = `
-            INSERT INTO withdrawals (id, user_id, binance_id, amount, type, status)
-            VALUES ($1, $2, $3, $4, $5, $6) RETURNING *;
+            INSERT INTO withdrawals (id, user_id, binance_id, wallet, amount, type, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *;
         `;
-        await pool.query(query, [id, finalUserId, binanceId, amount, finalType, 'Pending']);
+        await pool.query(query, [id, finalUserId, binanceId, finalWallet, amount, finalType, 'Pending']);
 
-        console.log(`[WITHDRAWAL SUCCESS] Binance ID: ${binanceId} | Amount: ${amount}`);
+        console.log(`[WITHDRAWAL SUCCESS] ID: ${binanceId} | Amount: ${amount}`);
         res.json({ success: true, message: "Request received" });
     } catch (err) {
         console.error("Database Save Error:", err.message);
@@ -88,6 +90,7 @@ app.get('/api/withdrawals', async (req, res) => {
                 id, 
                 user_id AS "userId",
                 binance_id AS "binanceId", 
+                wallet,
                 amount::INTEGER AS amount, 
                 type,
                 status, 
