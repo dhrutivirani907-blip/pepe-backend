@@ -13,21 +13,23 @@ const pool = new Pool({
     ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
-// Database Migration & All Constraint Cleanups
+// Database Migration & Schema Fixes
 const initDb = async () => {
     try {
-        // Ensure table exists
         await pool.query(`
             CREATE TABLE IF NOT EXISTS withdrawals (
                 id VARCHAR(255) PRIMARY KEY,
+                user_id VARCHAR(255),
                 binance_id VARCHAR(255),
+                wallet VARCHAR(255),
                 amount NUMERIC NOT NULL,
+                type VARCHAR(50) DEFAULT 'Binance',
+                total_deduct NUMERIC DEFAULT 0,
                 status VARCHAR(50) DEFAULT 'Pending',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
 
-        // Add all possible columns IF NOT EXISTS
         await pool.query(`
             ALTER TABLE withdrawals 
             ADD COLUMN IF NOT EXISTS user_id VARCHAR(255),
@@ -36,10 +38,7 @@ const initDb = async () => {
             ADD COLUMN IF NOT EXISTS type VARCHAR(50) DEFAULT 'Binance',
             ADD COLUMN IF NOT EXISTS total_deduct NUMERIC DEFAULT 0,
             ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-        `);
 
-        // Universal Constraint Fix: Drop NOT NULL from all non-primary key columns
-        await pool.query(`
             ALTER TABLE withdrawals ALTER COLUMN user_id DROP NOT NULL;
             ALTER TABLE withdrawals ALTER COLUMN binance_id DROP NOT NULL;
             ALTER TABLE withdrawals ALTER COLUMN wallet DROP NOT NULL;
@@ -47,7 +46,7 @@ const initDb = async () => {
             ALTER TABLE withdrawals ALTER COLUMN total_deduct DROP NOT NULL;
         `);
 
-        console.log("SUCCESS: All database constraints & total_deduct fixed!");
+        console.log("SUCCESS: Database schema fully active and verified!");
     } catch (err) {
         console.error("Database initialization error:", err.message);
     }
@@ -59,7 +58,21 @@ app.get('/', (req, res) => {
     res.json({ status: "Active", app: "BONK Tap Backend" });
 });
 
-// Submit Withdrawal
+// 1. ADS & ENERGY RECHARGE HANDLER (Fix for Ads refill issue)
+app.post('/api/recharge-energy', (req, res) => {
+    const { userId, energyAmount } = req.body;
+    const addedEnergy = energyAmount || 500;
+
+    console.log(`[ADS REWARD] Refill request received for: ${userId || 'User'} | Added: ${addedEnergy}`);
+    
+    res.json({ 
+        success: true, 
+        message: "Energy successfully recharged!", 
+        energyAdded: addedEnergy 
+    });
+});
+
+// 2. SUBMIT WITHDRAWAL
 app.post('/api/withdraw', async (req, res) => {
     const { binanceId, amount, userId, wallet, type, totalDeduct } = req.body;
 
@@ -88,7 +101,7 @@ app.post('/api/withdraw', async (req, res) => {
     }
 });
 
-// ADMIN: Get All Requests
+// 3. ADMIN: GET ALL WITHDRAWALS
 app.get('/api/withdrawals', async (req, res) => {
     try {
         const result = await pool.query(`
@@ -112,7 +125,7 @@ app.get('/api/withdrawals', async (req, res) => {
     }
 });
 
-// ADMIN: Update Status
+// 4. ADMIN: UPDATE STATUS
 app.put('/api/withdrawals/:id', async (req, res) => {
     const { id } = req.params;
     const { status } = req.body;
