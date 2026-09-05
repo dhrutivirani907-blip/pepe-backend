@@ -16,7 +16,7 @@ const pool = new Pool({
 // Database Migration & Table Init
 const initDb = async () => {
     try {
-        // Table me binance_id column missing hone par auto-add karega
+        // Base Table Creation
         await pool.query(`
             CREATE TABLE IF NOT EXISTS withdrawals (
                 id VARCHAR(255) PRIMARY KEY,
@@ -27,13 +27,14 @@ const initDb = async () => {
             );
         `);
 
-        // Extra Safety: Direct column check aur addition
+        // Missing Columns Auto-Add (Migration Fixes)
         await pool.query(`
             ALTER TABLE withdrawals 
-            ADD COLUMN IF NOT EXISTS binance_id VARCHAR(255);
+            ADD COLUMN IF NOT EXISTS binance_id VARCHAR(255),
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
         `);
 
-        console.log("Database schema synced successfully!");
+        console.log("Database schema fully synced with all columns!");
     } catch (err) {
         console.error("Database schema sync error:", err.message);
     }
