@@ -8,13 +8,13 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Render ke DATABASE_URL Variable se Auto-Connect
+// Database Connection
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
-// Database Table Auto-Create (Withdrawals Store Karne Ke Liye)
+// Table Setup
 const initDb = async () => {
     const createTableQuery = `
         CREATE TABLE IF NOT EXISTS withdrawals (
@@ -39,7 +39,7 @@ app.get('/', (req, res) => {
     res.json({ status: "Active", app: "BONK Tap Backend" });
 });
 
-// 1. Withdrawal Submit (Database Me Entry Direct Save Hogi)
+// Submit Withdrawal
 app.post('/api/withdraw', async (req, res) => {
     const { binanceId, amount } = req.body;
 
@@ -56,7 +56,6 @@ app.post('/api/withdraw', async (req, res) => {
         `;
         await pool.query(query, [id, binanceId, amount, 'Pending']);
 
-        console.log(`[WITHDRAWAL SAVED] Binance ID: ${binanceId} | Amount: ${amount}`);
         res.json({ success: true, message: "Request received" });
     } catch (err) {
         console.error("Database Save Error:", err);
@@ -64,10 +63,19 @@ app.post('/api/withdraw', async (req, res) => {
     }
 });
 
-// 2. Admin Panel: Database Se Sabhi Requests Fetch Karein
+// ADMIN: Get All Requests (Fixed Field Mapping for Frontend)
 app.get('/api/withdrawals', async (req, res) => {
     try {
-        const result = await pool.query('SELECT id, binance_id AS "binanceId", amount, status, created_at FROM withdrawals ORDER BY created_at DESC');
+        const result = await pool.query(`
+            SELECT 
+                id, 
+                binance_id AS "binanceId", 
+                amount::INTEGER AS amount, 
+                status, 
+                created_at 
+            FROM withdrawals 
+            ORDER BY created_at DESC
+        `);
         res.json(result.rows);
     } catch (err) {
         console.error("Database Fetch Error:", err);
@@ -75,7 +83,7 @@ app.get('/api/withdrawals', async (req, res) => {
     }
 });
 
-// 3. Admin Panel: Request Status (Approve / Reject) Update
+// ADMIN: Update Status
 app.put('/api/withdrawals/:id', async (req, res) => {
     const { id } = req.params;
     const { status } = req.body;
