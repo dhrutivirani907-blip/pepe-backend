@@ -8,28 +8,34 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Database Connection
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
-// Table Setup
+// Database Migration & Table Init
 const initDb = async () => {
-    const createTableQuery = `
-        CREATE TABLE IF NOT EXISTS withdrawals (
-            id VARCHAR(255) PRIMARY KEY,
-            binance_id VARCHAR(255) NOT NULL,
-            amount NUMERIC NOT NULL,
-            status VARCHAR(50) DEFAULT 'Pending',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    `;
     try {
-        await pool.query(createTableQuery);
-        console.log("Database table is active and ready!");
+        // Table me binance_id column missing hone par auto-add karega
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS withdrawals (
+                id VARCHAR(255) PRIMARY KEY,
+                binance_id VARCHAR(255),
+                amount NUMERIC NOT NULL,
+                status VARCHAR(50) DEFAULT 'Pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        // Extra Safety: Direct column check aur addition
+        await pool.query(`
+            ALTER TABLE withdrawals 
+            ADD COLUMN IF NOT EXISTS binance_id VARCHAR(255);
+        `);
+
+        console.log("Database schema synced successfully!");
     } catch (err) {
-        console.error("Database connection error:", err);
+        console.error("Database schema sync error:", err.message);
     }
 };
 
@@ -58,12 +64,12 @@ app.post('/api/withdraw', async (req, res) => {
 
         res.json({ success: true, message: "Request received" });
     } catch (err) {
-        console.error("Database Save Error:", err);
+        console.error("Database Save Error:", err.message);
         res.status(500).json({ success: false, message: "Database Error" });
     }
 });
 
-// ADMIN: Get All Requests (Fixed Field Mapping for Frontend)
+// ADMIN: Get All Requests
 app.get('/api/withdrawals', async (req, res) => {
     try {
         const result = await pool.query(`
@@ -78,7 +84,7 @@ app.get('/api/withdrawals', async (req, res) => {
         `);
         res.json(result.rows);
     } catch (err) {
-        console.error("Database Fetch Error:", err);
+        console.error("Database Fetch Error:", err.message);
         res.status(500).json({ success: false, message: "Database Error" });
     }
 });
@@ -97,7 +103,7 @@ app.put('/api/withdrawals/:id', async (req, res) => {
         }
         res.status(404).json({ success: false, message: "Record not found" });
     } catch (err) {
-        console.error("Database Update Error:", err);
+        console.error("Database Update Error:", err.message);
         res.status(500).json({ success: false, message: "Database Error" });
     }
 });
