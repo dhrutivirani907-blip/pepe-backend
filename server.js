@@ -13,10 +13,10 @@ const pool = new Pool({
     ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
-// Database Safe Migration
+// Database Migration & All Constraint Cleanups
 const initDb = async () => {
     try {
-        // Table reset karega agar purana strict schema hai
+        // Ensure table exists
         await pool.query(`
             CREATE TABLE IF NOT EXISTS withdrawals (
                 id VARCHAR(255) PRIMARY KEY,
@@ -27,22 +27,27 @@ const initDb = async () => {
             );
         `);
 
-        // Purane sabhi columns ke Strict NOT NULL constraints ko Hata dega
+        // Add all possible columns IF NOT EXISTS
         await pool.query(`
             ALTER TABLE withdrawals 
+            ADD COLUMN IF NOT EXISTS user_id VARCHAR(255),
             ADD COLUMN IF NOT EXISTS binance_id VARCHAR(255),
             ADD COLUMN IF NOT EXISTS wallet VARCHAR(255),
-            ADD COLUMN IF NOT EXISTS user_id VARCHAR(255),
             ADD COLUMN IF NOT EXISTS type VARCHAR(50) DEFAULT 'Binance',
+            ADD COLUMN IF NOT EXISTS total_deduct NUMERIC DEFAULT 0,
             ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-
-            ALTER TABLE withdrawals ALTER COLUMN user_id DROP NOT NULL;
-            ALTER TABLE withdrawals ALTER COLUMN type DROP NOT NULL;
-            ALTER TABLE withdrawals ALTER COLUMN binance_id DROP NOT NULL;
-            ALTER TABLE withdrawals ALTER COLUMN wallet DROP NOT NULL;
         `);
 
-        console.log("SUCCESS: Database schema completely cleaned and updated!");
+        // Universal Constraint Fix: Drop NOT NULL from all non-primary key columns
+        await pool.query(`
+            ALTER TABLE withdrawals ALTER COLUMN user_id DROP NOT NULL;
+            ALTER TABLE withdrawals ALTER COLUMN binance_id DROP NOT NULL;
+            ALTER TABLE withdrawals ALTER COLUMN wallet DROP NOT NULL;
+            ALTER TABLE withdrawals ALTER COLUMN type DROP NOT NULL;
+            ALTER TABLE withdrawals ALTER COLUMN total_deduct DROP NOT NULL;
+        `);
+
+        console.log("SUCCESS: All database constraints & total_deduct fixed!");
     } catch (err) {
         console.error("Database initialization error:", err.message);
     }
@@ -56,7 +61,7 @@ app.get('/', (req, res) => {
 
 // Submit Withdrawal
 app.post('/api/withdraw', async (req, res) => {
-    const { binanceId, amount, userId, wallet, type } = req.body;
+    const { binanceId, amount, userId, wallet, type, totalDeduct } = req.body;
 
     if (!binanceId || !amount || amount < 1000) {
         return res.status(400).json({ success: false, message: "Invalid Request Data" });
@@ -66,15 +71,16 @@ app.post('/api/withdraw', async (req, res) => {
     const finalUserId = userId || req.body.user_id || 'N/A';
     const finalWallet = wallet || req.body.wallet || binanceId;
     const finalType = type || req.body.type || 'Binance';
+    const finalDeduct = totalDeduct || req.body.total_deduct || amount;
 
     try {
         const query = `
-            INSERT INTO withdrawals (id, user_id, binance_id, wallet, amount, type, status)
-            VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *;
+            INSERT INTO withdrawals (id, user_id, binance_id, wallet, amount, type, total_deduct, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *;
         `;
-        await pool.query(query, [id, finalUserId, binanceId, finalWallet, amount, finalType, 'Pending']);
+        await pool.query(query, [id, finalUserId, binanceId, finalWallet, amount, finalType, finalDeduct, 'Pending']);
 
-        console.log(`[WITHDRAWAL SUCCESS] ID: ${binanceId} | Amount: ${amount}`);
+        console.log(`[WITHDRAWAL SUCCESS] Binance ID: ${binanceId} | Amount: ${amount}`);
         res.json({ success: true, message: "Request received" });
     } catch (err) {
         console.error("Database Save Error:", err.message);
@@ -93,6 +99,7 @@ app.get('/api/withdrawals', async (req, res) => {
                 wallet,
                 amount::INTEGER AS amount, 
                 type,
+                total_deduct AS "totalDeduct",
                 status, 
                 created_at 
             FROM withdrawals 
