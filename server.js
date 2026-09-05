@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs'); // File system module
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -8,73 +8,90 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-const FILE_PATH = './withdrawals.json';
+// Render ke DATABASE_URL Variable se Auto-Connect
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+});
 
-// File se data load karne ke liye helper function
-const loadWithdrawals = () => {
-    if (!fs.existsSync(FILE_PATH)) {
-        fs.writeFileSync(FILE_PATH, JSON.stringify([]));
+// Database Table Auto-Create (Withdrawals Store Karne Ke Liye)
+const initDb = async () => {
+    const createTableQuery = `
+        CREATE TABLE IF NOT EXISTS withdrawals (
+            id VARCHAR(255) PRIMARY KEY,
+            binance_id VARCHAR(255) NOT NULL,
+            amount NUMERIC NOT NULL,
+            status VARCHAR(50) DEFAULT 'Pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    `;
+    try {
+        await pool.query(createTableQuery);
+        console.log("Database table is active and ready!");
+    } catch (err) {
+        console.error("Database connection error:", err);
     }
-    const data = fs.readFileSync(FILE_PATH, 'utf8');
-    return JSON.parse(data || '[]');
 };
 
-// File me data save karne ke liye helper function
-const saveWithdrawals = (data) => {
-    fs.writeFileSync(FILE_PATH, JSON.stringify(data, null, 2));
-};
+initDb();
 
 app.get('/', (req, res) => {
     res.json({ status: "Active", app: "BONK Tap Backend" });
 });
 
-// User Withdrawal Submit Karega
-app.post('/api/withdraw', (req, res) => {
+// 1. Withdrawal Submit (Database Me Entry Direct Save Hogi)
+app.post('/api/withdraw', async (req, res) => {
     const { binanceId, amount } = req.body;
 
     if (!binanceId || !amount || amount < 1000) {
         return res.status(400).json({ success: false, message: "Invalid Request Data" });
     }
 
-    const withdrawals = loadWithdrawals();
+    const id = Date.now().toString();
 
-    const record = {
-        id: Date.now().toString(),
-        binanceId: binanceId,
-        amount: amount,
-        status: "Pending",
-        date: new Date()
-    };
+    try {
+        const query = `
+            INSERT INTO withdrawals (id, binance_id, amount, status)
+            VALUES ($1, $2, $3, $4) RETURNING *;
+        `;
+        await pool.query(query, [id, binanceId, amount, 'Pending']);
 
-    withdrawals.push(record);
-    saveWithdrawals(withdrawals); // File me save ho gaya
-
-    console.log(`[WITHDRAWAL] Binance ID: ${binanceId} | Amount: ${amount} BONK`);
-
-    res.json({ success: true, message: "Request received" });
+        console.log(`[WITHDRAWAL SAVED] Binance ID: ${binanceId} | Amount: ${amount}`);
+        res.json({ success: true, message: "Request received" });
+    } catch (err) {
+        console.error("Database Save Error:", err);
+        res.status(500).json({ success: false, message: "Database Error" });
+    }
 });
 
-// ADMIN: Get All Withdrawal Requests
-app.get('/api/withdrawals', (req, res) => {
-    const withdrawals = loadWithdrawals();
-    res.json(withdrawals);
+// 2. Admin Panel: Database Se Sabhi Requests Fetch Karein
+app.get('/api/withdrawals', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT id, binance_id AS "binanceId", amount, status, created_at FROM withdrawals ORDER BY created_at DESC');
+        res.json(result.rows);
+    } catch (err) {
+        console.error("Database Fetch Error:", err);
+        res.status(500).json({ success: false, message: "Database Error" });
+    }
 });
 
-// ADMIN: Update Status Approve/Reject
-app.put('/api/withdrawals/:id', (req, res) => {
+// 3. Admin Panel: Request Status (Approve / Reject) Update
+app.put('/api/withdrawals/:id', async (req, res) => {
     const { id } = req.params;
     const { status } = req.body;
 
-    let withdrawals = loadWithdrawals();
-    const item = withdrawals.find(w => w.id === id);
+    try {
+        const query = `UPDATE withdrawals SET status = $1 WHERE id = $2 RETURNING *;`;
+        const result = await pool.query(query, [status, id]);
 
-    if (item) {
-        item.status = status;
-        saveWithdrawals(withdrawals); // Updated status save ho gaya
-        return res.json({ success: true, message: `Status updated to ${status}` });
+        if (result.rowCount > 0) {
+            return res.json({ success: true, message: `Status updated to ${status}` });
+        }
+        res.status(404).json({ success: false, message: "Record not found" });
+    } catch (err) {
+        console.error("Database Update Error:", err);
+        res.status(500).json({ success: false, message: "Database Error" });
     }
-
-    res.status(404).json({ success: false, message: "Record not found" });
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
