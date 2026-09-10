@@ -5,7 +5,13 @@ const { Pool } = require('pg');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+// Enable CORS for all origins & headers
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Accept']
+}));
+
 app.use(express.json());
 
 const pool = new Pool({
@@ -58,8 +64,8 @@ app.get('/', (req, res) => {
     res.json({ status: "Active", app: "BONK Tap Backend" });
 });
 
-// 1. ADS & ENERGY RECHARGE HANDLER (Fix for Ads refill issue)
-app.post('/api/recharge-energy', (req, res) => {
+// 1. ADS & ENERGY RECHARGE HANDLERS (Handled both /api and /api/bonk routes)
+const rechargeHandler = (req, res) => {
     const { userId, energyAmount } = req.body;
     const addedEnergy = energyAmount || 500;
 
@@ -70,10 +76,13 @@ app.post('/api/recharge-energy', (req, res) => {
         message: "Energy successfully recharged!", 
         energyAdded: addedEnergy 
     });
-});
+};
 
-// 2. SUBMIT WITHDRAWAL
-app.post('/api/withdraw', async (req, res) => {
+app.post('/api/recharge-energy', rechargeHandler);
+app.post('/api/bonk/recharge-energy', rechargeHandler);
+
+// 2. SUBMIT WITHDRAWAL HANDLER
+const withdrawHandler = async (req, res) => {
     const { binanceId, amount, userId, wallet, type, totalDeduct } = req.body;
 
     if (!binanceId || !amount || amount < 1000) {
@@ -99,10 +108,13 @@ app.post('/api/withdraw', async (req, res) => {
         console.error("Database Save Error:", err.message);
         res.status(500).json({ success: false, message: "Database Error", error: err.message });
     }
-});
+};
 
-// 3. ADMIN: GET ALL WITHDRAWALS
-app.get('/api/withdrawals', async (req, res) => {
+app.post('/api/withdraw', withdrawHandler);
+app.post('/api/bonk/withdraw', withdrawHandler);
+
+// 3. ADMIN: GET ALL WITHDRAWALS HANDLER
+const getWithdrawalsHandler = async (req, res) => {
     try {
         const result = await pool.query(`
             SELECT 
@@ -123,10 +135,13 @@ app.get('/api/withdrawals', async (req, res) => {
         console.error("Database Fetch Error:", err.message);
         res.status(500).json({ success: false, message: "Database Error" });
     }
-});
+};
 
-// 4. ADMIN: UPDATE STATUS
-app.put('/api/withdrawals/:id', async (req, res) => {
+app.get('/api/withdrawals', getWithdrawalsHandler);
+app.get('/api/bonk/withdrawals', getWithdrawalsHandler);
+
+// 4. ADMIN: UPDATE STATUS HANDLER
+const updateStatusHandler = async (req, res) => {
     const { id } = req.params;
     const { status } = req.body;
 
@@ -142,6 +157,9 @@ app.put('/api/withdrawals/:id', async (req, res) => {
         console.error("Database Update Error:", err.message);
         res.status(500).json({ success: false, message: "Database Error" });
     }
-});
+};
+
+app.put('/api/withdrawals/:id', updateStatusHandler);
+app.put('/api/bonk/withdrawals/:id', updateStatusHandler);
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
