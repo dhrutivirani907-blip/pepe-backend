@@ -603,24 +603,77 @@ app.put(
 const REFERRAL_REWARD = 300;
 
 
-// -----------------------------------------------------
-// Referral code format
-// -----------------------------------------------------
-//
-// Telegram user ID example:
-// 123456789
-//
-// Referral code:
-// U123456789
-//
-// Referral link:
-// https://t.me/PEPE_Faucet_Airdrop_bot?start=U123456789
-//
-// -----------------------------------------------------
+// =====================================================
+// REFERRAL TABLE
+// =====================================================
+
+const initReferralDb = async () => {
+    try {
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS bonk_referrals (
+                id BIGSERIAL PRIMARY KEY,
+                referrer_id VARCHAR(255) NOT NULL,
+                referred_user_id VARCHAR(255) NOT NULL UNIQUE,
+                referral_code VARCHAR(255) NOT NULL,
+                reward NUMERIC NOT NULL DEFAULT 300,
+                status VARCHAR(50) NOT NULL DEFAULT 'Completed',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        await pool.query(`
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            unique_bonk_referral_user
+            ON bonk_referrals(referred_user_id);
+        `);
+
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_bonk_referral_code
+            ON bonk_referrals(referral_code);
+        `);
+
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_bonk_referrer_id
+            ON bonk_referrals(referrer_id);
+        `);
+
+
+        // -------------------------------------------------
+        // Pending rewards for referrer
+        // -------------------------------------------------
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS bonk_referral_rewards (
+                user_id VARCHAR(255) PRIMARY KEY,
+                pending_reward NUMERIC NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+
+        console.log(
+            "SUCCESS: BONK referral database ready!"
+        );
+
+    } catch (err) {
+
+        console.error(
+            "Referral database initialization error:",
+            err.message
+        );
+
+    }
+};
+
+
+initReferralDb();
 
 
 // =====================================================
-// PROCESS REFERRAL
+// PROCESS NEW REFERRAL
 // =====================================================
 
 app.post(
@@ -636,12 +689,9 @@ app.post(
         if (!userId) {
 
             return res.status(400).json({
-
                 success: false,
-
-                message:
-                    "User ID is required"
-
+                rewardAdded: false,
+                message: "User ID is required"
             });
 
         }
@@ -650,12 +700,9 @@ app.post(
         if (!referralCode) {
 
             return res.status(400).json({
-
                 success: false,
-
-                message:
-                    "Referral code is required"
-
+                rewardAdded: false,
+                message: "Referral code is required"
             });
 
         }
@@ -666,32 +713,48 @@ app.post(
 
 
         const cleanReferralCode =
-            String(referralCode)
-                .trim();
+            String(referralCode).trim();
+
+
+        // -------------------------------------------------
+        // Referral code format
+        // -------------------------------------------------
+
+        if (
+            !/^U[0-9]+$/i.test(
+                cleanReferralCode
+            )
+        ) {
+
+            return res.status(400).json({
+                success: false,
+                rewardAdded: false,
+                message: "Invalid referral code"
+            });
+
+        }
+
+
+        // -------------------------------------------------
+        // Get referrer Telegram ID
+        // -------------------------------------------------
+
+        const referrerId =
+            cleanReferralCode.substring(1);
 
 
         // -------------------------------------------------
         // Prevent self referral
         // -------------------------------------------------
 
-        const ownReferralCode =
-            "U" + cleanUserId;
-
-
         if (
-            cleanReferralCode.toUpperCase() ===
-            ownReferralCode.toUpperCase()
+            referrerId === cleanUserId
         ) {
 
             return res.json({
-
                 success: false,
-
                 rewardAdded: false,
-
-                message:
-                    "You cannot use your own referral link."
-
+                message: "Self referral is not allowed"
             });
 
         }
@@ -709,16 +772,16 @@ app.post(
 
 
             // -------------------------------------------------
-            // Check if this user already received referral
+            // Check duplicate referred user
             // -------------------------------------------------
 
-            const existingReferral =
+            const existing =
                 await client.query(
                     `
                     SELECT id
                     FROM bonk_referrals
                     WHERE referred_user_id = $1
-                    LIMIT 1;
+                    LIMIT 1
                     `,
                     [
                         cleanUserId
@@ -727,169 +790,24 @@ app.post(
 
 
             if (
-                existingReferral.rowCount > 0
+                existing.rowCount > 0
             ) {
 
                 await client.query(
                     'ROLLBACK'
                 );
 
-
                 return res.json({
-
                     success: true,
-
                     rewardAdded: false,
-
-                    message:
-                        "Referral already processed."
-
+                    message: "Referral already processed"
                 });
 
             }
 
 
             // -------------------------------------------------
-            // Referral code must be in U123456 format
-            // -------------------------------------------------
-
-            if (
-                !/^U[0-9]+$/i.test(
-                    cleanReferralCode
-                )
-            ) {
-
-                await client.query(
-                    'ROLLBACK'
-                );
-
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    rewardAdded: false,
-
-                    message:
-                        "Invalid referral code."
-
-                });
-
-            }
-
-
-            // -------------------------------------------------
-            // Extract referrer Telegram ID
-            // -------------------------------------------------
-
-            const referrerId =
-                cleanReferralCode
-                    .substring(1);
-
-
-            if (!referrerId) {
-
-                await client.query(
-                    'ROLLBACK'
-                );
-
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    rewardAdded: false,
-
-                    message:
-                        "Invalid referral code."
-
-                });
-
-            }
-
-
-            // -------------------------------------------------
-            // Prevent self referral
-            // -------------------------------------------------
-
-            if (
-                referrerId ===
-                cleanUserId
-            ) {
-
-                await client.query(
-                    'ROLLBACK'
-                );
-
-
-                return res.json({
-
-                    success: false,
-
-                    rewardAdded: false,
-
-                    message:
-                        "Self referral is not allowed."
-
-                });
-
-            }
-
-
-            // -------------------------------------------------
-            // Check whether referrer has already referred
-            // this exact user
-            // -------------------------------------------------
-
-            const duplicateCheck =
-                await client.query(
-                    `
-                    SELECT id
-                    FROM bonk_referrals
-                    WHERE
-                        referrer_id = $1
-                        AND referred_user_id = $2
-                    LIMIT 1;
-                    `,
-                    [
-                        referrerId,
-                        cleanUserId
-                    ]
-                );
-
-
-            if (
-                duplicateCheck.rowCount > 0
-            ) {
-
-                await client.query(
-                    'ROLLBACK'
-                );
-
-
-                return res.json({
-
-                    success: true,
-
-                    rewardAdded: false,
-
-                    message:
-                        "Referral already processed."
-
-                });
-
-            }
-
-
-            // -------------------------------------------------
-            // Find / create referrer balance record
-            //
-            // IMPORTANT:
-            // This server currently stores BONK balance
-            // on the frontend localStorage.
-            //
-            // Therefore referral reward is recorded here,
-            // while the frontend receives the reward status.
+            // Save referral
             // -------------------------------------------------
 
             await client.query(
@@ -909,12 +827,43 @@ app.post(
                     $3,
                     $4,
                     'Completed'
-                );
+                )
                 `,
                 [
                     referrerId,
                     cleanUserId,
                     cleanReferralCode,
+                    REFERRAL_REWARD
+                ]
+            );
+
+
+            // -------------------------------------------------
+            // ADD 300 BONK TO REFERRER PENDING BALANCE
+            // -------------------------------------------------
+
+            await client.query(
+                `
+                INSERT INTO bonk_referral_rewards
+                (
+                    user_id,
+                    pending_reward
+                )
+                VALUES
+                (
+                    $1,
+                    $2
+                )
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    pending_reward =
+                        bonk_referral_rewards.pending_reward
+                        + EXCLUDED.pending_reward,
+                    updated_at =
+                        CURRENT_TIMESTAMP
+                `,
+                [
+                    referrerId,
                     REFERRAL_REWARD
                 ]
             );
@@ -936,48 +885,36 @@ app.post(
 
                 rewardAdded: true,
 
-                reward:
-                    REFERRAL_REWARD,
+                reward: REFERRAL_REWARD,
 
                 message:
-                    "Referral completed successfully."
+                    "Referral completed. Reward added to referrer."
 
             });
+
 
         } catch (err) {
 
             try {
-
                 await client.query(
                     'ROLLBACK'
                 );
-
             } catch (rollbackError) {
-
                 console.error(
                     "Rollback Error:",
                     rollbackError.message
                 );
-
             }
 
-
-            // PostgreSQL unique constraint
-            // protects against duplicate rewards
 
             if (
                 err.code === '23505'
             ) {
 
                 return res.json({
-
                     success: true,
-
                     rewardAdded: false,
-
-                    message:
-                        "Referral already processed."
-
+                    message: "Referral already processed"
                 });
 
             }
@@ -1012,6 +949,328 @@ app.post(
     }
 );
 
+
+// =====================================================
+// CLAIM PENDING REFERRAL REWARD
+// =====================================================
+
+app.post(
+    '/api/bonk/referral/claim',
+    async (req, res) => {
+
+        const {
+            userId
+        } = req.body;
+
+
+        if (!userId) {
+
+            return res.status(400).json({
+
+                success: false,
+
+                reward: 0,
+
+                message:
+                    "User ID is required"
+
+            });
+
+        }
+
+
+        const cleanUserId =
+            String(userId).trim();
+
+
+        const client =
+            await pool.connect();
+
+
+        try {
+
+            await client.query(
+                'BEGIN'
+            );
+
+
+            const result =
+                await client.query(
+                    `
+                    SELECT pending_reward
+                    FROM bonk_referral_rewards
+                    WHERE user_id = $1
+                    FOR UPDATE
+                    `,
+                    [
+                        cleanUserId
+                    ]
+                );
+
+
+            if (
+                result.rowCount === 0
+            ) {
+
+                await client.query(
+                    'COMMIT'
+                );
+
+
+                return res.json({
+
+                    success: true,
+
+                    reward: 0
+
+                });
+
+            }
+
+
+            const reward =
+                Number(
+                    result.rows[0].pending_reward || 0
+                );
+
+
+            if (reward <= 0) {
+
+                await client.query(
+                    'COMMIT'
+                );
+
+
+                return res.json({
+
+                    success: true,
+
+                    reward: 0
+
+                });
+
+            }
+
+
+            // -------------------------------------------------
+            // IMPORTANT:
+            // Claim only once.
+            // -------------------------------------------------
+
+            await client.query(
+                `
+                UPDATE bonk_referral_rewards
+                SET
+                    pending_reward = 0,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = $1
+                `,
+                [
+                    cleanUserId
+                ]
+            );
+
+
+            await client.query(
+                'COMMIT'
+            );
+
+
+            console.log(
+                `[REFERRAL CLAIM] User: ${cleanUserId} | Reward: ${reward} BONK`
+            );
+
+
+            return res.json({
+
+                success: true,
+
+                reward: reward,
+
+                message:
+                    "Referral reward claimed"
+
+            });
+
+
+        } catch (err) {
+
+            try {
+                await client.query(
+                    'ROLLBACK'
+                );
+            } catch (rollbackError) {}
+
+            console.error(
+                "Referral Claim Error:",
+                err.message
+            );
+
+
+            return res.status(500).json({
+
+                success: false,
+
+                reward: 0,
+
+                message:
+                    "Referral claim failed"
+
+            });
+
+        } finally {
+
+            client.release();
+
+        }
+
+    }
+);
+
+
+// =====================================================
+// REFERRAL STATISTICS
+// =====================================================
+
+app.get(
+    '/api/bonk/referral/stats/:userId',
+    async (req, res) => {
+
+        const userId =
+            String(
+                req.params.userId
+            ).trim();
+
+
+        try {
+
+            const result =
+                await pool.query(
+                    `
+                    SELECT
+                        COUNT(*)::INTEGER AS "referralCount",
+                        COALESCE(
+                            SUM(reward),
+                            0
+                        )::NUMERIC AS "referralEarned"
+                    FROM bonk_referrals
+                    WHERE
+                        referrer_id = $1
+                        AND status = 'Completed'
+                    `,
+                    [
+                        userId
+                    ]
+                );
+
+
+            const stats =
+                result.rows[0] || {};
+
+
+            res.json({
+
+                success: true,
+
+                referralCount:
+                    Number(
+                        stats.referralCount || 0
+                    ),
+
+                referralEarned:
+                    Number(
+                        stats.referralEarned || 0
+                    )
+
+            });
+
+        } catch (err) {
+
+            console.error(
+                "Referral Stats Error:",
+                err.message
+            );
+
+
+            res.status(500).json({
+
+                success: false,
+
+                message:
+                    "Database Error"
+
+            });
+
+        }
+
+    }
+);
+
+
+// =====================================================
+// REFERRAL LIST
+// =====================================================
+
+app.get(
+    '/api/bonk/referral/list/:userId',
+    async (req, res) => {
+
+        const userId =
+            String(
+                req.params.userId
+            ).trim();
+
+
+        try {
+
+            const result =
+                await pool.query(
+                    `
+                    SELECT
+                        referred_user_id AS "userId",
+                        reward,
+                        status,
+                        created_at AS "createdAt"
+                    FROM bonk_referrals
+                    WHERE referrer_id = $1
+                    ORDER BY created_at DESC
+                    `,
+                    [
+                        userId
+                    ]
+                );
+
+
+            res.json({
+
+                success: true,
+
+                referrals:
+                    result.rows
+
+            });
+
+        } catch (err) {
+
+            console.error(
+                "Referral List Error:",
+                err.message
+            );
+
+
+            res.status(500).json({
+
+                success: false,
+
+                message:
+                    "Database Error"
+
+            });
+
+        }
+
+    }
+);
 
 // =====================================================
 // 7. REFERRAL STATISTICS
