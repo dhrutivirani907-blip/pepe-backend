@@ -1451,6 +1451,92 @@ app.get(
 );
 
 
+
+// =====================================================
+// 9. BONK WEEKLY CONTEST
+// =====================================================
+const CONTEST_ADMIN_PASSWORD = process.env.CONTEST_ADMIN_PASSWORD;
+const contestTableSql = `
+CREATE TABLE IF NOT EXISTS bonk_weekly_contest (
+    user_id VARCHAR(255) PRIMARY KEY,
+    binance_id VARCHAR(255) NOT NULL,
+    total_ads INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);`;
+
+(async () => {
+    try {
+        await pool.query(contestTableSql);
+        console.log('SUCCESS: BONK weekly contest database ready!');
+    } catch (err) {
+        console.error('Contest database initialization error:', err.message);
+    }
+})();
+
+app.get('/api/bonk/contest/stats/:userId', async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT binance_id AS "binanceId", total_ads AS "totalAds" FROM bonk_weekly_contest WHERE user_id = $1',
+            [String(req.params.userId).trim()]
+        );
+        const row = result.rows[0] || {};
+        res.json({success: true, binanceId: row.binanceId || null, totalAds: Number(row.totalAds || 0)});
+    } catch (err) {
+        res.status(500).json({success: false, message: 'Database Error'});
+    }
+});
+
+app.post('/api/bonk/contest/ad', async (req, res) => {
+    const userId = String(req.body.userId || '').trim();
+    const binanceId = String(req.body.binanceId || '').trim();
+    if (!userId || !/^[0-9]{5,20}$/.test(binanceId)) {
+        return res.status(400).json({success: false, message: 'Valid user ID and Binance UID are required.'});
+    }
+    try {
+        const result = await pool.query(`
+            INSERT INTO bonk_weekly_contest (user_id, binance_id, total_ads)
+            VALUES ($1, $2, 1)
+            ON CONFLICT (user_id)
+            DO UPDATE SET binance_id = EXCLUDED.binance_id,
+                          total_ads = bonk_weekly_contest.total_ads + 1,
+                          updated_at = CURRENT_TIMESTAMP
+            RETURNING binance_id AS "binanceId", total_ads AS "totalAds";
+        `, [userId, binanceId]);
+        res.json({success: true, ...result.rows[0]});
+    } catch (err) {
+        res.status(500).json({success: false, message: 'Database Error'});
+    }
+});
+
+app.get('/api/bonk/contest/leaderboard', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT binance_id AS "binanceId", total_ads AS "totalAds",
+                   RANK() OVER (ORDER BY total_ads DESC, updated_at ASC) AS rank
+            FROM bonk_weekly_contest
+            ORDER BY total_ads DESC, updated_at ASC;
+        `);
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({success: false, message: 'Database Error'});
+    }
+});
+
+app.post('/api/bonk/contest/reset', async (req, res) => {
+    if (!CONTEST_ADMIN_PASSWORD) {
+        return res.status(503).json({success: false, message: 'Admin password is not configured on the server.'});
+    }
+    if (String(req.body.password || '') !== CONTEST_ADMIN_PASSWORD) {
+        return res.status(401).json({success: false, message: 'Invalid admin password.'});
+    }
+    try {
+        await pool.query('UPDATE bonk_weekly_contest SET total_ads = 0, updated_at = CURRENT_TIMESTAMP');
+        res.json({success: true, message: 'Leaderboard reset successfully.'});
+    } catch (err) {
+        res.status(500).json({success: false, message: 'Database Error'});
+    }
+});
+
 // =====================================================
 // SERVER START
 // =====================================================
