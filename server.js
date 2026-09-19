@@ -1647,6 +1647,70 @@ app.post('/api/bonk/nft/activate', async (req, res) => {
 });
 
 // =====================================================
+// 11. BONK NFT ADMIN PANEL
+// =====================================================
+// Open this page in a browser:
+// https://YOUR-RENDER-DOMAIN.onrender.com/admin
+// =====================================================
+
+app.get('/admin', (req, res) => {
+    res.type('html').send(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BONK NFT Admin Panel</title>
+<style>
+body{font-family:Arial,sans-serif;background:#111;color:#fff;max-width:520px;margin:40px auto;padding:20px}
+.card{background:#1d1d1d;padding:24px;border-radius:16px;box-shadow:0 0 20px #000}
+h1{color:#ffcc00;font-size:25px}
+label{display:block;margin-top:16px;margin-bottom:6px}
+input,button{width:100%;box-sizing:border-box;padding:13px;border-radius:9px;border:1px solid #555;font-size:16px}
+input{background:#292929;color:#fff}
+button{margin-top:20px;background:#ffcc00;color:#111;border:0;font-weight:bold;cursor:pointer}
+#result{margin-top:18px;white-space:pre-wrap;line-height:1.5}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>🟡 BONK NFT Admin Panel</h1>
+<p>Activate a user's NFT for 1 month.</p>
+<form id="activateForm">
+<label for="nftId">NFT ID</label>
+<input id="nftId" name="nftId" placeholder="NFT-99599" required>
+<label for="password">Admin Password</label>
+<input id="password" name="password" type="password" placeholder="Enter admin password" required>
+<button type="submit">Activate NFT</button>
+</form>
+<div id="result"></div>
+</div>
+<script>
+document.getElementById('activateForm').addEventListener('submit', async function(event){
+    event.preventDefault();
+    const resultBox = document.getElementById('result');
+    resultBox.textContent = 'Processing...';
+    const nftId = document.getElementById('nftId').value.trim();
+    const password = document.getElementById('password').value;
+    try {
+        const response = await fetch('/api/bonk/nft/activate', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+            body: JSON.stringify({nftId, password})
+        });
+        const data = await response.json();
+        resultBox.textContent = data.success
+            ? 'Success: ' + data.message + '\\nNFT: ' + data.nftId + '\\nExpires: ' + (data.expiresAt || 'N/A')
+            : 'Error: ' + (data.message || 'Request failed');
+    } catch (error) {
+        resultBox.textContent = 'Network error: ' + error.message;
+    }
+});
+</script>
+</body>
+</html>`);
+});
+
+// =====================================================
 // SERVER START
 // =====================================================
 
