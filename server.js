@@ -1537,6 +1537,115 @@ app.post('/api/bonk/contest/reset', async (req, res) => {
     }
 });
 
+
+// =====================================================
+// 10. BONK NFT MEMBERSHIP
+// =====================================================
+const NFT_ADMIN_PASSWORD = process.env.CONTEST_ADMIN_PASSWORD;
+const nftTableSql = `
+CREATE TABLE IF NOT EXISTS bonk_nfts (
+    user_id VARCHAR(255) PRIMARY KEY,
+    nft_id VARCHAR(32) UNIQUE NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'Inactive',
+    activated_at TIMESTAMP NULL,
+    expires_at TIMESTAMP NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);`;
+
+(async () => {
+    try {
+        await pool.query(nftTableSql);
+        console.log('SUCCESS: BONK NFT database ready!');
+    } catch (err) {
+        console.error('NFT database initialization error:', err.message);
+    }
+})();
+
+function createNftId() {
+    const digits = Math.floor(10000 + Math.random() * 90000);
+    return `NFT-${digits}`;
+}
+
+app.get('/api/bonk/nft/status/:userId', async (req, res) => {
+    const userId = String(req.params.userId || '').trim();
+    if (!userId) return res.status(400).json({success:false, message:'User ID is required.'});
+    try {
+        let result = await pool.query(
+            'SELECT nft_id AS "nftId", status, expires_at AS "expiresAt" FROM bonk_nfts WHERE user_id = $1',
+            [userId]
+        );
+        if (result.rowCount === 0) {
+            let nftId;
+            for (let attempt = 0; attempt < 5; attempt++) {
+                nftId = createNftId();
+                try {
+                    await pool.query(
+                        'INSERT INTO bonk_nfts (user_id, nft_id) VALUES ($1, $2)',
+                        [userId, nftId]
+                    );
+                    break;
+                } catch (err) {
+                    if (err.code !== '23505' || attempt === 4) throw err;
+                }
+            }
+            result = await pool.query(
+                'SELECT nft_id AS "nftId", status, expires_at AS "expiresAt" FROM bonk_nfts WHERE user_id = $1',
+                [userId]
+            );
+        }
+        const row = result.rows[0];
+        const expired = row.status === 'Active' && row.expiresAt && new Date(row.expiresAt).getTime() <= Date.now();
+        if (expired) {
+            await pool.query(
+                "UPDATE bonk_nfts SET status = 'Inactive', activated_at = NULL, expires_at = NULL WHERE user_id = $1",
+                [userId]
+            );
+            return res.json({success:true, nftId:row.nftId, status:'Inactive', active:false, expiresAt:null});
+        }
+        res.json({
+            success:true,
+            nftId:row.nftId,
+            status:row.status,
+            active:row.status === 'Active',
+            expiresAt:row.expiresAt || null
+        });
+    } catch (err) {
+        console.error('NFT status error:', err.message);
+        res.status(500).json({success:false, message:'Database Error'});
+    }
+});
+
+app.post('/api/bonk/nft/activate', async (req, res) => {
+    const nftId = String(req.body.nftId || '').trim().toUpperCase();
+    const password = String(req.body.password || '');
+    if (!NFT_ADMIN_PASSWORD) {
+        return res.status(503).json({success:false, message:'Admin password is not configured on the server.'});
+    }
+    if (password !== NFT_ADMIN_PASSWORD) {
+        return res.status(401).json({success:false, message:'Invalid admin password.'});
+    }
+    if (!/^NFT-[A-Z0-9]{5,20}$/.test(nftId)) {
+        return res.status(400).json({success:false, message:'Invalid NFT ID.'});
+    }
+    try {
+        const result = await pool.query(`
+            UPDATE bonk_nfts
+            SET status = 'Active',
+                activated_at = CURRENT_TIMESTAMP,
+                expires_at = CURRENT_TIMESTAMP + INTERVAL '1 month'
+            WHERE nft_id = $1
+            RETURNING nft_id AS "nftId", status, expires_at AS "expiresAt";
+        `, [nftId]);
+        if (result.rowCount === 0) {
+            return res.status(404).json({success:false, message:'NFT ID not found.'});
+        }
+        res.json({success:true, ...result.rows[0], message:'NFT activated for 1 month.'});
+    } catch (err) {
+        console.error('NFT activation error:', err.message);
+        res.status(500).json({success:false, message:'Database Error'});
+    }
+});
+
 // =====================================================
 // SERVER START
 // =====================================================
