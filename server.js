@@ -213,7 +213,7 @@ const withdrawHandler = async (
     if (
         !binanceId ||
         !amount ||
-        amount < 5000
+        amount < 2000
     ) {
 
         return res.status(400).json({
