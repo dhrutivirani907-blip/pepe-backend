@@ -44,6 +44,19 @@ const initDb = async () => {
             );
         `);
 
+        // AdsGram server-side reward callback ledger
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS adsgram_rewards (
+                id BIGSERIAL PRIMARY KEY,
+                user_id VARCHAR(255) NOT NULL,
+                reward_amount NUMERIC NOT NULL DEFAULT 300,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS idx_adsgram_rewards_user_id
+            ON adsgram_rewards(user_id);
+        `);
 
         await pool.query(`
             ALTER TABLE withdrawals 
@@ -189,6 +202,83 @@ app.post(
     rechargeHandler
 );
 
+// =====================================================
+// AdsGram Reward URL callback
+// Configure ADSGRAM_REWARD_AMOUNT in Render if a different
+// reward amount is required. Default: 30. Also set ADSGRAM_CALLBACK_SECRET.
+// AdsGram Reward URL format:
+// https://YOUR-BACKEND.onrender.com/api/adsgram/reward?userid=[userId]&key=YOUR_SECRET
+// =====================================================
+app.get('/api/adsgram/reward', async (req, res) => {
+    const userId = String(req.query.userid || req.query.userId || '').trim();
+    const suppliedKey = String(req.query.key || '');
+    const configuredKey = String(process.env.ADSGRAM_CALLBACK_SECRET || '');
+    const rewardAmount = Number(process.env.ADSGRAM_REWARD_AMOUNT || 30);
+
+    // Set the same secret in Render and in the AdsGram Reward URL.
+    // This prevents arbitrary visitors from directly calling the public callback.
+    if (!configuredKey || suppliedKey.length !== configuredKey.length || suppliedKey !== configuredKey) {
+        return res.status(401).json({ success: false, message: 'Invalid AdsGram callback key.' });
+    }
+
+    if (!/^[0-9]{1,25}$/.test(userId)) {
+        return res.status(400).json({
+            success: false,
+            message: 'A valid Telegram user ID is required.'
+        });
+    }
+
+    if (!Number.isFinite(rewardAmount) || rewardAmount <= 0) {
+        return res.status(500).json({
+            success: false,
+            message: 'AdsGram reward amount is not configured correctly.'
+        });
+    }
+
+    try {
+        await pool.query(
+            'INSERT INTO adsgram_rewards (user_id, reward_amount) VALUES ($1, $2)',
+            [userId, rewardAmount]
+        );
+        console.log(`[AdsGram REWARD] Telegram user ${userId} | Reward recorded: ${rewardAmount}`);
+        return res.status(200).json({
+            success: true,
+            message: 'AdsGram reward callback recorded.',
+            userId,
+            reward: rewardAmount
+        });
+    } catch (err) {
+        console.error('[AdsGram REWARD] Database error:', err.message);
+        return res.status(500).json({
+            success: false,
+            message: 'Could not record AdsGram reward.'
+        });
+    }
+});
+
+// Read-only endpoint to check recorded AdsGram rewards for a Telegram user.
+app.get('/api/adsgram/rewards/:userId', async (req, res) => {
+    const userId = String(req.params.userId || '').trim();
+    if (!/^[0-9]{1,25}$/.test(userId)) {
+        return res.status(400).json({ success: false, message: 'Invalid Telegram user ID.' });
+    }
+    try {
+        const result = await pool.query(
+            `SELECT COALESCE(SUM(reward_amount), 0) AS "totalReward", COUNT(*) AS "rewardCount"
+             FROM adsgram_rewards WHERE user_id = $1`,
+            [userId]
+        );
+        return res.json({
+            success: true,
+            userId,
+            totalReward: Number(result.rows[0].totalReward || 0),
+            rewardCount: Number(result.rows[0].rewardCount || 0)
+        });
+    } catch (err) {
+        console.error('[AdsGram REWARD CHECK] Database error:', err.message);
+        return res.status(500).json({ success: false, message: 'Database Error' });
+    }
+});
 
 // =====================================================
 // 2. SUBMIT WITHDRAWAL HANDLER
