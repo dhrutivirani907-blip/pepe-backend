@@ -49,7 +49,7 @@ const initDb = async () => {
             CREATE TABLE IF NOT EXISTS adsgram_rewards (
                 id BIGSERIAL PRIMARY KEY,
                 user_id VARCHAR(255) NOT NULL,
-                reward_amount NUMERIC NOT NULL DEFAULT 300,
+                reward_amount NUMERIC NOT NULL DEFAULT 100,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
@@ -205,7 +205,7 @@ app.post(
 // =====================================================
 // AdsGram Reward URL callback
 // Configure ADSGRAM_REWARD_AMOUNT in Render if a different
-// reward amount is required. Default: 30. Also set ADSGRAM_CALLBACK_SECRET.
+// reward amount is required. Default: 100. Daily limit: 50 ads per Telegram user. Also set ADSGRAM_CALLBACK_SECRET.
 // AdsGram Reward URL format:
 // https://YOUR-BACKEND.onrender.com/api/adsgram/reward?userid=[userId]&key=YOUR_SECRET
 // =====================================================
@@ -213,7 +213,8 @@ app.get('/api/adsgram/reward', async (req, res) => {
     const userId = String(req.query.userid || req.query.userId || '').trim();
     const suppliedKey = String(req.query.key || '');
     const configuredKey = String(process.env.ADSGRAM_CALLBACK_SECRET || '');
-    const rewardAmount = Number(process.env.ADSGRAM_REWARD_AMOUNT || 30);
+    const rewardAmount = Number(process.env.ADSGRAM_REWARD_AMOUNT || 100);
+    const dailyLimit = 50;
 
     // Set the same secret in Render and in the AdsGram Reward URL.
     // This prevents arbitrary visitors from directly calling the public callback.
@@ -236,6 +237,25 @@ app.get('/api/adsgram/reward', async (req, res) => {
     }
 
     try {
+        // Enforce the 50-ad daily limit on the server as well as in the UI.
+        const dailyResult = await pool.query(
+            `SELECT COUNT(*)::int AS count
+             FROM adsgram_rewards
+             WHERE user_id = $1
+               AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
+                   (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date`,
+            [userId]
+        );
+        const todayCount = Number(dailyResult.rows[0]?.count || 0);
+        if (todayCount >= dailyLimit) {
+            return res.status(429).json({
+                success: false,
+                message: 'Daily AdsGram limit reached (50 ads).',
+                dailyLimit,
+                count: todayCount
+            });
+        }
+
         await pool.query(
             'INSERT INTO adsgram_rewards (user_id, reward_amount) VALUES ($1, $2)',
             [userId, rewardAmount]
@@ -245,7 +265,9 @@ app.get('/api/adsgram/reward', async (req, res) => {
             success: true,
             message: 'AdsGram reward callback recorded.',
             userId,
-            reward: rewardAmount
+            reward: rewardAmount,
+            dailyLimit,
+            dailyCount: todayCount + 1
         });
     } catch (err) {
         console.error('[AdsGram REWARD] Database error:', err.message);
