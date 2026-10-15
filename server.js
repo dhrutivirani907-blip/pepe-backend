@@ -712,7 +712,7 @@ app.put(
 // 6. BONK REFERRAL SYSTEM
 // =====================================================
 
-const REFERRAL_REWARD = 300;
+const REFERRAL_REWARD = 300; // 300 VB referral reward
 
 
 // =====================================================
@@ -767,7 +767,7 @@ const initReferralDb = async () => {
 
 
         console.log(
-            "SUCCESS: BONK referral database ready!"
+            "SUCCESS: VB referral database ready!"
         );
 
     } catch (err) {
@@ -951,7 +951,7 @@ app.post(
 
 
             // -------------------------------------------------
-            // ADD 300 BONK TO REFERRER PENDING BALANCE
+            // ADD 300 VB TO REFERRER PENDING BALANCE
             // -------------------------------------------------
 
             await client.query(
@@ -987,7 +987,7 @@ app.post(
 
 
             console.log(
-                `[REFERRAL SUCCESS] Referrer: ${referrerId} | New User: ${cleanUserId} | Reward: ${REFERRAL_REWARD} BONK`
+                `[REFERRAL SUCCESS] Referrer: ${referrerId} | New User: ${cleanUserId} | Reward: ${REFERRAL_REWARD} VB`
             );
 
 
@@ -1189,7 +1189,7 @@ app.post(
 
 
             console.log(
-                `[REFERRAL CLAIM] User: ${cleanUserId} | Reward: ${reward} BONK`
+                `[REFERRAL CLAIM] User: ${cleanUserId} | Reward: ${reward} VB`
             );
 
 
