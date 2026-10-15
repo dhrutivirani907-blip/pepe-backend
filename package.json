@@ -19,3 +19,13 @@
     "node": ">=18.0.0"
   }
 }
+{
+  "name": "vb-coin-catcher-adsgram",
+  "version": "1.0.0",
+  "private": true,
+  "description": "VB Coin Catcher Telegram Mini App with Adsgram rewarded-ad integration",
+  "main": "server.js",
+  "scripts": {"start": "node server.js", "check": "node --check server.js"},
+  "engines": {"node": ">=20"},
+  "dependencies": {"cors": "^2.8.5", "express": "^4.21.2", "pg": "^8.13.1"}
+}
