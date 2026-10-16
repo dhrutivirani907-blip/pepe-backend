@@ -1759,6 +1759,138 @@ app.post('/api/bonk/nft/activate', async (req, res) => {
 });
 
 // =====================================================
+// BINANCE UID BAN MANAGEMENT
+// Admin password: set CONTEST_ADMIN_PASSWORD in Render environment.
+// =====================================================
+const binanceBanTableReady = pool.query(`
+    CREATE TABLE IF NOT EXISTS binance_uid_bans (
+        binance_id VARCHAR(32) PRIMARY KEY,
+        reason TEXT NOT NULL,
+        banned_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+`).then(() => {
+    console.log('SUCCESS: Binance UID ban database ready!');
+}).catch((err) => {
+    console.error('Binance UID ban table initialization error:', err.message);
+});
+
+function isValidBinanceUid(value) {
+    return /^[0-9]{5,20}$/.test(String(value || '').trim());
+}
+
+function requireBanAdmin(req, res) {
+    if (!process.env.CONTEST_ADMIN_PASSWORD) {
+        res.status(503).json({ success: false, message: 'Admin password is not configured. Set CONTEST_ADMIN_PASSWORD in Render.' });
+        return false;
+    }
+    if (String(req.body.password || '') !== process.env.CONTEST_ADMIN_PASSWORD) {
+        res.status(401).json({ success: false, message: 'Invalid admin password.' });
+        return false;
+    }
+    return true;
+}
+
+// The app checks this endpoint on launch and after a Binance UID is saved.
+app.get('/api/bonk/ban-status/:binanceId', async (req, res) => {
+    const binanceId = String(req.params.binanceId || '').trim();
+    if (!isValidBinanceUid(binanceId)) {
+        return res.status(400).json({ success: false, message: 'Invalid Binance UID.' });
+    }
+    try {
+        await binanceBanTableReady;
+        const result = await pool.query(
+            'SELECT reason, banned_at AS "bannedAt" FROM binance_uid_bans WHERE binance_id = $1',
+            [binanceId]
+        );
+        const row = result.rows[0];
+        return res.json({ success: true, banned: Boolean(row), reason: row ? row.reason : '' });
+    } catch (err) {
+        console.error('Ban status check failed:', err.message);
+        return res.status(500).json({ success: false, message: 'Could not check account status.' });
+    }
+});
+
+app.post('/api/admin/binance-bans/list', async (req, res) => {
+    if (!requireBanAdmin(req, res)) return;
+    try {
+        await binanceBanTableReady;
+        const result = await pool.query(
+            'SELECT binance_id AS "binanceId", reason, banned_at AS "bannedAt" FROM binance_uid_bans ORDER BY banned_at DESC LIMIT 500'
+        );
+        return res.json({ success: true, bans: result.rows });
+    } catch (err) {
+        console.error('Ban list failed:', err.message);
+        return res.status(500).json({ success: false, message: 'Could not load ban list.' });
+    }
+});
+
+app.post('/api/admin/binance-bans/ban', async (req, res) => {
+    if (!requireBanAdmin(req, res)) return;
+    const binanceId = String(req.body.binanceId || '').trim();
+    const reason = String(req.body.reason || '').trim().slice(0, 1000);
+    if (!isValidBinanceUid(binanceId)) {
+        return res.status(400).json({ success: false, message: 'Enter a valid numeric Binance UID (5–20 digits).' });
+    }
+    if (!reason) {
+        return res.status(400).json({ success: false, message: 'Ban reason is required.' });
+    }
+    try {
+        await binanceBanTableReady;
+        await pool.query(`
+            INSERT INTO binance_uid_bans (binance_id, reason)
+            VALUES ($1, $2)
+            ON CONFLICT (binance_id) DO UPDATE
+            SET reason = EXCLUDED.reason, updated_at = CURRENT_TIMESTAMP
+        `, [binanceId, reason]);
+        return res.json({ success: true, message: 'Binance UID banned/updated successfully.' });
+    } catch (err) {
+        console.error('Ban action failed:', err.message);
+        return res.status(500).json({ success: false, message: 'Could not save ban.' });
+    }
+});
+
+app.post('/api/admin/binance-bans/unban', async (req, res) => {
+    if (!requireBanAdmin(req, res)) return;
+    const binanceId = String(req.body.binanceId || '').trim();
+    if (!isValidBinanceUid(binanceId)) {
+        return res.status(400).json({ success: false, message: 'Enter a valid numeric Binance UID.' });
+    }
+    try {
+        await binanceBanTableReady;
+        const result = await pool.query('DELETE FROM binance_uid_bans WHERE binance_id = $1', [binanceId]);
+        return res.json({ success: true, message: result.rowCount ? 'Ban removed.' : 'No ban found for this Binance UID.' });
+    } catch (err) {
+        console.error('Unban action failed:', err.message);
+        return res.status(500).json({ success: false, message: 'Could not remove ban.' });
+    }
+});
+
+app.get('/admin-ban', (req, res) => {
+    res.type('html').send(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VB Coin Catcher — Ban Admin</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;padding:24px;background:radial-gradient(ellipse at top,#1b2b46,#080b12 65%);color:#f5f7fb;font:15px/1.5 Inter,system-ui,Arial,sans-serif}.wrap{max-width:860px;margin:0 auto}.hero,.panel{background:rgba(19,27,43,.94);border:1px solid #34445f;border-radius:22px;padding:24px;box-shadow:0 18px 60px #0005;margin-bottom:18px}.eyebrow{color:#69d8ff;font-size:12px;letter-spacing:2px;font-weight:800}.hero h1{margin:8px 0;font-size:clamp(25px,5vw,36px)}.muted{color:#aab7cc}.field{display:block;margin:16px 0 6px;color:#d7e2f3;font-weight:700}input,textarea{width:100%;padding:13px 14px;border:1px solid #3d506e;border-radius:12px;background:#0d1422;color:#fff;font:inherit;outline:none}textarea{min-height:90px;resize:vertical}button{border:0;border-radius:12px;padding:12px 16px;font-weight:800;cursor:pointer;background:linear-gradient(135deg,#52d6ff,#8c7bff);color:#07111e}button.secondary{background:#25344b;color:#e8f2ff;border:1px solid #425774}button.danger{background:#ff496e;color:white;padding:9px 12px}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}.actions button{flex:1}.notice{margin-top:14px;white-space:pre-wrap;color:#b9f4d4}.notice.error{color:#ff9cae}.rowitem{display:flex;gap:14px;align-items:flex-start;justify-content:space-between;padding:16px 0;border-bottom:1px solid #2b3b53}.rowitem:last-child{border-bottom:0}.uid{font-weight:900;letter-spacing:.5px}.reason{color:#b9c7db;white-space:pre-wrap;overflow-wrap:anywhere}.date{font-size:12px;color:#7f91ac;margin-top:5px}.hidden{display:none!important}.pill{font-size:11px;font-weight:800;color:#ff9fb2;background:#4a1d2a;border-radius:999px;padding:4px 8px}.small{font-size:13px}@media(max-width:520px){body{padding:12px}.hero,.panel{padding:17px}.rowitem{flex-direction:column}.rowitem button{width:100%}}
+</style></head><body><main class="wrap">
+<section class="hero"><div class="eyebrow">VB COIN CATCHER · ADMIN</div><h1>Binance UID Ban Control</h1><p class="muted">Ban a saved Binance UID and show your reason in a blocking app popup. You can also remove a ban later.</p></section>
+<section class="panel" id="loginPanel"><h2>Admin authentication</h2><label class="field" for="password">Admin password</label><input id="password" type="password" autocomplete="current-password" placeholder="Enter CONTEST_ADMIN_PASSWORD"><div class="actions"><button id="loginBtn">Unlock panel</button></div><div id="loginMsg" class="notice"></div></section>
+<div id="mainPanel" class="hidden">
+<section class="panel"><h2>Ban a Binance UID</h2><label class="field" for="binanceId">Binance UID (numbers only)</label><input id="binanceId" inputmode="numeric" maxlength="20" placeholder="e.g. 123456789"><label class="field" for="reason">Reason shown to the user</label><textarea id="reason" maxlength="1000" placeholder="Write the ban reason clearly..."></textarea><div class="actions"><button id="banBtn">Ban / Update reason</button><button class="secondary" id="refreshBtn">Refresh ban list</button></div><div id="actionMsg" class="notice"></div></section>
+<section class="panel"><h2>Currently banned UIDs</h2><p class="muted small">Up to 500 most recent bans are shown.</p><div id="banList" class="muted">No list loaded.</div></section>
+</div></main>
+<script>
+const $=id=>document.getElementById(id);let adminPassword='';
+async function api(path,body={}){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...body,password:adminPassword})});const d=await r.json().catch(()=>({success:false,message:'Invalid server response'}));if(!r.ok||!d.success)throw new Error(d.message||'Request failed');return d}
+function msg(id,text,error=false){$(id).textContent=text;$(id).classList.toggle('error',error)}
+async function refreshList(){const d=await api('/api/admin/binance-bans/list');const box=$('banList');box.innerHTML='';if(!d.bans.length){box.textContent='No banned Binance UIDs.';return}for(const b of d.bans){const item=document.createElement('div');item.className='rowitem';const left=document.createElement('div');const uid=document.createElement('div');uid.className='uid';uid.textContent=b.binanceId;const pill=document.createElement('span');pill.className='pill';pill.textContent='BANNED';uid.append(' ',pill);const reason=document.createElement('div');reason.className='reason';reason.textContent=b.reason;const date=document.createElement('div');date.className='date';date.textContent=b.bannedAt?'Banned: '+new Date(b.bannedAt).toLocaleString():'';left.append(uid,reason,date);const btn=document.createElement('button');btn.className='danger';btn.textContent='Unban';btn.addEventListener('click',async()=>{if(!confirm('Remove ban for Binance UID '+b.binanceId+'?'))return;try{const x=await api('/api/admin/binance-bans/unban',{binanceId:b.binanceId});msg('actionMsg',x.message);await refreshList()}catch(e){msg('actionMsg',e.message,true)}});item.append(left,btn);box.append(item)}}
+$('loginBtn').addEventListener('click',async()=>{adminPassword=$('password').value;if(!adminPassword){msg('loginMsg','Enter the admin password.',true);return}try{await api('/api/admin/binance-bans/list');$('loginPanel').classList.add('hidden');$('mainPanel').classList.remove('hidden');await refreshList()}catch(e){adminPassword='';msg('loginMsg',e.message,true)}});
+$('banBtn').addEventListener('click',async()=>{const binanceId=$('binanceId').value.trim(),reason=$('reason').value.trim();if(!/^[0-9]{5,20}$/.test(binanceId)){msg('actionMsg','Enter a valid numeric Binance UID (5–20 digits).',true);return}if(!reason){msg('actionMsg','Please enter a reason.',true);return}try{const d=await api('/api/admin/binance-bans/ban',{binanceId,reason});msg('actionMsg',d.message);await refreshList()}catch(e){msg('actionMsg',e.message,true)}});
+$('refreshBtn').addEventListener('click',async()=>{try{await refreshList();msg('actionMsg','Ban list refreshed.')}catch(e){msg('actionMsg',e.message,true)}});
+</script></body></html>`);
+});
+
+// =====================================================
 // 11. BONK NFT ADMIN PANEL
 // =====================================================
 // Open this page in a browser:
