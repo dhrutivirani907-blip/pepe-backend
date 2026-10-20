@@ -1,20 +1,10 @@
-
 {
-  "name": "vb-coin-catcher-adsgram",
+  "name": "usdt-fan-miner",
   "version": "1.0.0",
   "private": true,
-  "description": "VB Coin Catcher Telegram Mini App with Adsgram and backend API",
+  "description": "USDT Fan Miner app with manual BEP20 deposit and withdrawal review",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "check": "node --check server.js"
-  },
-  "engines": {
-    "node": ">=20"
-  },
-  "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^4.21.2",
-    "pg": "^8.13.1"
-  }
+  "scripts": { "start": "node server.js", "check": "node --check server.js" },
+  "engines": { "node": ">=20" },
+  "dependencies": { "cors": "^2.8.5", "express": "^4.21.2", "pg": "^8.13.1" }
 }
