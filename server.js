@@ -1,104 +1,1726 @@
 const express = require('express');
 const cors = require('cors');
-const crypto = require('crypto');
 const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const ADMIN_KEY = String(process.env.ADMIN_KEY || '');
-const DEPOSIT_ADDRESS = String(process.env.USDT_BEP20_ADDRESS || '0xeaf649489fc27078f4f86734f4ff770469416b3a');
-const MIN_DEPOSIT = 1;
-const MAX_DEPOSIT = 50;
-const POWER_PER_USDT = 100;
-const POWER_DAYS = 15;
-const MIN_WITHDRAWAL = 1.5;
-const RATE_PER_POWER_PER_SECOND = Number(process.env.RATE_PER_POWER_PER_SECOND || 0.00000001929);
 
-app.use(cors({ origin: '*', methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization','X-Admin-Key'] }));
-app.use(express.json({ limit: '1mb' }));
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false });
+// Enable CORS for all origins & headers
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Accept']
+}));
 
-const id = () => crypto.randomUUID();
-const emailNorm = v => String(v || '').trim().toLowerCase();
-const adminOnly = (req,res,next) => {
-  const supplied = String(req.headers['x-admin-key'] || req.body?.adminKey || '');
-  if (!ADMIN_KEY) return res.status(503).json({ success:false, message:'ADMIN_KEY is not configured on the server.' });
-  const a = Buffer.from(supplied); const b = Buffer.from(ADMIN_KEY);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a,b)) return res.status(401).json({success:false,message:'Invalid admin key.'});
-  next();
+app.use(express.json());
+
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL
+        ? { rejectUnauthorized: false }
+        : false
+});
+
+
+// =====================================================
+// DATABASE MIGRATION & SCHEMA FIXES
+// =====================================================
+
+const initDb = async () => {
+    try {
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS withdrawals (
+                id VARCHAR(255) PRIMARY KEY,
+                user_id VARCHAR(255),
+                binance_id VARCHAR(255),
+                wallet VARCHAR(255),
+                amount NUMERIC NOT NULL,
+                type VARCHAR(50) DEFAULT 'Binance',
+                token_type VARCHAR(50) DEFAULT 'BONK',
+                total_deduct NUMERIC DEFAULT 0,
+                status VARCHAR(50) DEFAULT 'Pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+
+        await pool.query(`
+            ALTER TABLE withdrawals 
+            ADD COLUMN IF NOT EXISTS user_id VARCHAR(255),
+            ADD COLUMN IF NOT EXISTS binance_id VARCHAR(255),
+            ADD COLUMN IF NOT EXISTS wallet VARCHAR(255),
+            ADD COLUMN IF NOT EXISTS type VARCHAR(50) DEFAULT 'Binance',
+            ADD COLUMN IF NOT EXISTS token_type VARCHAR(50) DEFAULT 'BONK',
+            ADD COLUMN IF NOT EXISTS total_deduct NUMERIC DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+            ALTER TABLE withdrawals ALTER COLUMN user_id DROP NOT NULL;
+            ALTER TABLE withdrawals ALTER COLUMN binance_id DROP NOT NULL;
+            ALTER TABLE withdrawals ALTER COLUMN wallet DROP NOT NULL;
+            ALTER TABLE withdrawals ALTER COLUMN type DROP NOT NULL;
+            ALTER TABLE withdrawals ALTER COLUMN total_deduct DROP NOT NULL;
+        `);
+
+
+        // =================================================
+        // REFERRAL TABLE
+        // =================================================
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS bonk_referrals (
+                id BIGSERIAL PRIMARY KEY,
+                referrer_id VARCHAR(255) NOT NULL,
+                referred_user_id VARCHAR(255) NOT NULL UNIQUE,
+                referral_code VARCHAR(255) NOT NULL,
+                reward NUMERIC NOT NULL DEFAULT 300,
+                status VARCHAR(50) NOT NULL DEFAULT 'Completed',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+
+        // Prevent duplicate referral reward
+        await pool.query(`
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            unique_bonk_referral_user
+            ON bonk_referrals(referred_user_id);
+        `);
+
+
+        // Index for faster referral-code lookup
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_bonk_referral_code
+            ON bonk_referrals(referral_code);
+        `);
+
+
+        // Index for referrer statistics
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_bonk_referrer_id
+            ON bonk_referrals(referrer_id);
+        `);
+
+
+        console.log(
+            "SUCCESS: Database schema fully active and verified!"
+        );
+
+        console.log(
+            "SUCCESS: BONK referral system database ready!"
+        );
+
+    } catch (err) {
+
+        console.error(
+            "Database initialization error:",
+            err.message
+        );
+
+    }
 };
-async function initDb(){
-  await pool.query(`CREATE TABLE IF NOT EXISTS usdt_users (
-    email TEXT PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  )`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS usdt_deposits (
-    id TEXT PRIMARY KEY, email TEXT NOT NULL REFERENCES usdt_users(email), amount NUMERIC(18,8) NOT NULL,
-    txid TEXT NOT NULL UNIQUE, network TEXT NOT NULL DEFAULT 'BEP20', status TEXT NOT NULL DEFAULT 'Pending',
-    admin_note TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), reviewed_at TIMESTAMPTZ
-  )`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS usdt_power (
-    id TEXT PRIMARY KEY, email TEXT NOT NULL REFERENCES usdt_users(email), amount NUMERIC(18,8) NOT NULL,
-    source_deposit_id TEXT, expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  )`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS usdt_withdrawals (
-    id TEXT PRIMARY KEY, email TEXT NOT NULL REFERENCES usdt_users(email), amount NUMERIC(18,8) NOT NULL,
-    wallet TEXT NOT NULL, network TEXT NOT NULL DEFAULT 'BEP20', status TEXT NOT NULL DEFAULT 'Pending',
-    admin_note TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), reviewed_at TIMESTAMPTZ
-  )`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS usdt_history (
-    id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL REFERENCES usdt_users(email), kind TEXT NOT NULL,
-    amount NUMERIC(18,8) NOT NULL DEFAULT 0, detail TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  )`);
-  await pool.query('CREATE INDEX IF NOT EXISTS idx_usdt_deposits_email ON usdt_deposits(email)');
-  await pool.query('CREATE INDEX IF NOT EXISTS idx_usdt_power_email_expiry ON usdt_power(email, expires_at)');
-  await pool.query('CREATE INDEX IF NOT EXISTS idx_usdt_withdrawals_email ON usdt_withdrawals(email)');
-  console.log('USDT Fan Miner database ready');
+
+
+initDb();
+
+
+// =====================================================
+// ROOT
+// =====================================================
+
+app.get('/', (req, res) => {
+
+    res.json({
+        status: "Active",
+        app: "BONK Tap Backend"
+    });
+
+});
+
+
+// =====================================================
+// 1. ADS & ENERGY RECHARGE HANDLERS
+// =====================================================
+
+const rechargeHandler = (req, res) => {
+
+    const {
+        userId,
+        energyAmount
+    } = req.body;
+
+
+    const addedEnergy =
+        energyAmount || 300;
+
+
+    console.log(
+        `[ADS REWARD] Refill request received for: ${
+            userId || 'User'
+        } | Added: ${addedEnergy}`
+    );
+
+
+    res.json({
+
+        success: true,
+
+        message:
+            "Energy successfully recharged!",
+
+        energyAdded:
+            addedEnergy
+
+    });
+
+};
+
+
+app.post(
+    '/api/recharge-energy',
+    rechargeHandler
+);
+
+
+app.post(
+    '/api/bonk/recharge-energy',
+    rechargeHandler
+);
+
+
+// =====================================================
+// 2. SUBMIT WITHDRAWAL HANDLER
+// =====================================================
+
+const withdrawHandler = async (
+    req,
+    res
+) => {
+
+    const {
+        binanceId,
+        amount,
+        userId,
+        wallet,
+        type,
+        tokenType,
+        totalDeduct
+    } = req.body;
+
+
+    if (
+        !binanceId ||
+        !amount ||
+        amount < 2000
+    ) {
+
+        return res.status(400).json({
+
+            success: false,
+
+            message:
+                "Invalid Request Data"
+
+        });
+
+    }
+
+
+    const id =
+        Date.now().toString();
+
+
+    const finalUserId =
+        userId ||
+        req.body.user_id ||
+        'N/A';
+
+
+    const finalWallet =
+        wallet ||
+        req.body.wallet ||
+        binanceId;
+
+
+    const finalType =
+        type ||
+        req.body.type ||
+        'Binance';
+
+
+    const finalTokenType =
+        tokenType ||
+        req.body.token_type ||
+        'BONK';
+
+
+    const finalDeduct =
+        totalDeduct ||
+        req.body.total_deduct ||
+        amount;
+
+
+    try {
+
+        const query = `
+            INSERT INTO withdrawals
+            (
+                id,
+                user_id,
+                binance_id,
+                wallet,
+                amount,
+                type,
+                token_type,
+                total_deduct,
+                status
+            )
+            VALUES
+            (
+                $1,
+                $2,
+                $3,
+                $4,
+                $5,
+                $6,
+                $7,
+                $8,
+                $9
+            )
+            RETURNING *;
+        `;
+
+
+        await pool.query(
+            query,
+            [
+                id,
+                finalUserId,
+                binanceId,
+                finalWallet,
+                amount,
+                finalType,
+                finalTokenType,
+                finalDeduct,
+                'Pending'
+            ]
+        );
+
+
+        console.log(
+            `[WITHDRAWAL SUCCESS] Token: ${finalTokenType} | Binance ID: ${binanceId} | Amount: ${amount}`
+        );
+
+
+        res.json({
+
+            success: true,
+
+            message:
+                "Request received"
+
+        });
+
+    } catch (err) {
+
+        console.error(
+            "Database Save Error:",
+            err.message
+        );
+
+
+        res.status(500).json({
+
+            success: false,
+
+            message:
+                "Database Error",
+
+            error:
+                err.message
+
+        });
+
+    }
+
+};
+
+
+app.post(
+    '/api/withdraw',
+    withdrawHandler
+);
+
+
+app.post(
+    '/api/bonk/withdraw',
+    withdrawHandler
+);
+
+
+// =====================================================
+// 3. GET BONK WITHDRAWALS
+// =====================================================
+
+app.get(
+    '/api/bonk/withdrawals',
+    async (req, res) => {
+
+        try {
+
+            const query = `
+                SELECT
+                    id,
+                    user_id AS "userId",
+                    binance_id AS "binanceId",
+                    wallet,
+                    amount,
+                    type,
+                    token_type AS "tokenType",
+                    status,
+                    created_at AS "createdAt"
+                FROM withdrawals
+                WHERE
+                    UPPER(token_type) = 'BONK'
+                    OR token_type IS NULL
+                ORDER BY created_at DESC;
+            `;
+
+
+            const result =
+                await pool.query(query);
+
+
+            res.json(
+                result.rows
+            );
+
+        } catch (err) {
+
+            console.error(
+                "Database Fetch Error:",
+                err.message
+            );
+
+
+            res.status(500).json({
+
+                success: false,
+
+                message:
+                    "Database Error",
+
+                error:
+                    err.message
+
+            });
+
+        }
+
+    }
+);
+
+
+// =====================================================
+// 4. GET ALL WITHDRAWALS
+// =====================================================
+
+app.get(
+    '/api/withdrawals',
+    async (req, res) => {
+
+        try {
+
+            const query = `
+                SELECT
+                    id,
+                    user_id AS "userId",
+                    binance_id AS "binanceId",
+                    wallet,
+                    amount,
+                    type,
+                    token_type AS "tokenType",
+                    status,
+                    created_at AS "createdAt"
+                FROM withdrawals
+                ORDER BY created_at DESC;
+            `;
+
+
+            const result =
+                await pool.query(query);
+
+
+            res.json(
+                result.rows
+            );
+
+        } catch (err) {
+
+            console.error(
+                "Database Fetch Error:",
+                err.message
+            );
+
+
+            res.status(500).json({
+
+                success: false,
+
+                message:
+                    "Database Error",
+
+                error:
+                    err.message
+
+            });
+
+        }
+
+    }
+);
+
+
+// =====================================================
+// 5. UPDATE WITHDRAWAL STATUS HANDLER
+// =====================================================
+
+const updateStatusHandler =
+    async (req, res) => {
+
+        const {
+            id
+        } = req.params;
+
+
+        const {
+            status
+        } = req.body;
+
+
+        if (!status) {
+
+            return res.status(400).json({
+
+                success: false,
+
+                message:
+                    "Status is required"
+
+            });
+
+        }
+
+
+        try {
+
+            const query = `
+                UPDATE withdrawals
+                SET status = $1
+                WHERE id = $2
+                RETURNING *;
+            `;
+
+
+            const result =
+                await pool.query(
+                    query,
+                    [
+                        status,
+                        id
+                    ]
+                );
+
+
+            if (
+                result.rowCount === 0
+            ) {
+
+                return res.status(404).json({
+
+                    success: false,
+
+                    message:
+                        "Request not found"
+
+                });
+
+            }
+
+
+            res.json({
+
+                success: true,
+
+                message:
+                    `Status updated to ${status}`
+
+            });
+
+        } catch (err) {
+
+            console.error(
+                "Database Update Error:",
+                err.message
+            );
+
+
+            res.status(500).json({
+
+                success: false,
+
+                message:
+                    "Database Error",
+
+                error:
+                    err.message
+
+            });
+
+        }
+
+    };
+
+
+app.put(
+    '/api/withdrawals/:id',
+    updateStatusHandler
+);
+
+
+app.put(
+    '/api/bonk/withdrawals/:id',
+    updateStatusHandler
+);
+
+
+// =====================================================
+// 6. BONK REFERRAL SYSTEM
+// =====================================================
+
+const REFERRAL_REWARD = 300;
+
+
+// =====================================================
+// REFERRAL TABLE
+// =====================================================
+
+const initReferralDb = async () => {
+    try {
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS bonk_referrals (
+                id BIGSERIAL PRIMARY KEY,
+                referrer_id VARCHAR(255) NOT NULL,
+                referred_user_id VARCHAR(255) NOT NULL UNIQUE,
+                referral_code VARCHAR(255) NOT NULL,
+                reward NUMERIC NOT NULL DEFAULT 300,
+                status VARCHAR(50) NOT NULL DEFAULT 'Completed',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        await pool.query(`
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            unique_bonk_referral_user
+            ON bonk_referrals(referred_user_id);
+        `);
+
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_bonk_referral_code
+            ON bonk_referrals(referral_code);
+        `);
+
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_bonk_referrer_id
+            ON bonk_referrals(referrer_id);
+        `);
+
+
+        // -------------------------------------------------
+        // Pending rewards for referrer
+        // -------------------------------------------------
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS bonk_referral_rewards (
+                user_id VARCHAR(255) PRIMARY KEY,
+                pending_reward NUMERIC NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+
+        console.log(
+            "SUCCESS: BONK referral database ready!"
+        );
+
+    } catch (err) {
+
+        console.error(
+            "Referral database initialization error:",
+            err.message
+        );
+
+    }
+};
+
+
+initReferralDb();
+
+
+// =====================================================
+// PROCESS NEW REFERRAL
+// =====================================================
+
+app.post(
+    '/api/bonk/referral',
+    async (req, res) => {
+
+        const {
+            userId,
+            referralCode
+        } = req.body;
+
+
+        if (!userId) {
+
+            return res.status(400).json({
+                success: false,
+                rewardAdded: false,
+                message: "User ID is required"
+            });
+
+        }
+
+
+        if (!referralCode) {
+
+            return res.status(400).json({
+                success: false,
+                rewardAdded: false,
+                message: "Referral code is required"
+            });
+
+        }
+
+
+        const cleanUserId =
+            String(userId).trim();
+
+
+        const cleanReferralCode =
+            String(referralCode).trim();
+
+
+        // -------------------------------------------------
+        // Referral code format
+        // -------------------------------------------------
+
+        if (
+            !/^U[0-9]+$/i.test(
+                cleanReferralCode
+            )
+        ) {
+
+            return res.status(400).json({
+                success: false,
+                rewardAdded: false,
+                message: "Invalid referral code"
+            });
+
+        }
+
+
+        // -------------------------------------------------
+        // Get referrer Telegram ID
+        // -------------------------------------------------
+
+        const referrerId =
+            cleanReferralCode.substring(1);
+
+
+        // -------------------------------------------------
+        // Prevent self referral
+        // -------------------------------------------------
+
+        if (
+            referrerId === cleanUserId
+        ) {
+
+            return res.json({
+                success: false,
+                rewardAdded: false,
+                message: "Self referral is not allowed"
+            });
+
+        }
+
+
+        const client =
+            await pool.connect();
+
+
+        try {
+
+            await client.query(
+                'BEGIN'
+            );
+
+
+            // -------------------------------------------------
+            // Check duplicate referred user
+            // -------------------------------------------------
+
+            const existing =
+                await client.query(
+                    `
+                    SELECT id
+                    FROM bonk_referrals
+                    WHERE referred_user_id = $1
+                    LIMIT 1
+                    `,
+                    [
+                        cleanUserId
+                    ]
+                );
+
+
+            if (
+                existing.rowCount > 0
+            ) {
+
+                await client.query(
+                    'ROLLBACK'
+                );
+
+                return res.json({
+                    success: true,
+                    rewardAdded: false,
+                    message: "Referral already processed"
+                });
+
+            }
+
+
+            // -------------------------------------------------
+            // Save referral
+            // -------------------------------------------------
+
+            await client.query(
+                `
+                INSERT INTO bonk_referrals
+                (
+                    referrer_id,
+                    referred_user_id,
+                    referral_code,
+                    reward,
+                    status
+                )
+                VALUES
+                (
+                    $1,
+                    $2,
+                    $3,
+                    $4,
+                    'Completed'
+                )
+                `,
+                [
+                    referrerId,
+                    cleanUserId,
+                    cleanReferralCode,
+                    REFERRAL_REWARD
+                ]
+            );
+
+
+            // -------------------------------------------------
+            // ADD 300 BONK TO REFERRER PENDING BALANCE
+            // -------------------------------------------------
+
+            await client.query(
+                `
+                INSERT INTO bonk_referral_rewards
+                (
+                    user_id,
+                    pending_reward
+                )
+                VALUES
+                (
+                    $1,
+                    $2
+                )
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    pending_reward =
+                        bonk_referral_rewards.pending_reward
+                        + EXCLUDED.pending_reward,
+                    updated_at =
+                        CURRENT_TIMESTAMP
+                `,
+                [
+                    referrerId,
+                    REFERRAL_REWARD
+                ]
+            );
+
+
+            await client.query(
+                'COMMIT'
+            );
+
+
+            console.log(
+                `[REFERRAL SUCCESS] Referrer: ${referrerId} | New User: ${cleanUserId} | Reward: ${REFERRAL_REWARD} BONK`
+            );
+
+
+            return res.json({
+
+                success: true,
+
+                rewardAdded: true,
+
+                reward: REFERRAL_REWARD,
+
+                message:
+                    "Referral completed. Reward added to referrer."
+
+            });
+
+
+        } catch (err) {
+
+            try {
+                await client.query(
+                    'ROLLBACK'
+                );
+            } catch (rollbackError) {
+                console.error(
+                    "Rollback Error:",
+                    rollbackError.message
+                );
+            }
+
+
+            if (
+                err.code === '23505'
+            ) {
+
+                return res.json({
+                    success: true,
+                    rewardAdded: false,
+                    message: "Referral already processed"
+                });
+
+            }
+
+
+            console.error(
+                "Referral Processing Error:",
+                err.message
+            );
+
+
+            return res.status(500).json({
+
+                success: false,
+
+                rewardAdded: false,
+
+                message:
+                    "Referral Database Error",
+
+                error:
+                    err.message
+
+            });
+
+        } finally {
+
+            client.release();
+
+        }
+
+    }
+);
+
+
+// =====================================================
+// CLAIM PENDING REFERRAL REWARD
+// =====================================================
+
+app.post(
+    '/api/bonk/referral/claim',
+    async (req, res) => {
+
+        const {
+            userId
+        } = req.body;
+
+
+        if (!userId) {
+
+            return res.status(400).json({
+
+                success: false,
+
+                reward: 0,
+
+                message:
+                    "User ID is required"
+
+            });
+
+        }
+
+
+        const cleanUserId =
+            String(userId).trim();
+
+
+        const client =
+            await pool.connect();
+
+
+        try {
+
+            await client.query(
+                'BEGIN'
+            );
+
+
+            const result =
+                await client.query(
+                    `
+                    SELECT pending_reward
+                    FROM bonk_referral_rewards
+                    WHERE user_id = $1
+                    FOR UPDATE
+                    `,
+                    [
+                        cleanUserId
+                    ]
+                );
+
+
+            if (
+                result.rowCount === 0
+            ) {
+
+                await client.query(
+                    'COMMIT'
+                );
+
+
+                return res.json({
+
+                    success: true,
+
+                    reward: 0
+
+                });
+
+            }
+
+
+            const reward =
+                Number(
+                    result.rows[0].pending_reward || 0
+                );
+
+
+            if (reward <= 0) {
+
+                await client.query(
+                    'COMMIT'
+                );
+
+
+                return res.json({
+
+                    success: true,
+
+                    reward: 0
+
+                });
+
+            }
+
+
+            // -------------------------------------------------
+            // IMPORTANT:
+            // Claim only once.
+            // -------------------------------------------------
+
+            await client.query(
+                `
+                UPDATE bonk_referral_rewards
+                SET
+                    pending_reward = 0,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = $1
+                `,
+                [
+                    cleanUserId
+                ]
+            );
+
+
+            await client.query(
+                'COMMIT'
+            );
+
+
+            console.log(
+                `[REFERRAL CLAIM] User: ${cleanUserId} | Reward: ${reward} BONK`
+            );
+
+
+            return res.json({
+
+                success: true,
+
+                reward: reward,
+
+                message:
+                    "Referral reward claimed"
+
+            });
+
+
+        } catch (err) {
+
+            try {
+                await client.query(
+                    'ROLLBACK'
+                );
+            } catch (rollbackError) {}
+
+            console.error(
+                "Referral Claim Error:",
+                err.message
+            );
+
+
+            return res.status(500).json({
+
+                success: false,
+
+                reward: 0,
+
+                message:
+                    "Referral claim failed"
+
+            });
+
+        } finally {
+
+            client.release();
+
+        }
+
+    }
+);
+
+
+// =====================================================
+// REFERRAL STATISTICS
+// =====================================================
+
+app.get(
+    '/api/bonk/referral/stats/:userId',
+    async (req, res) => {
+
+        const userId =
+            String(
+                req.params.userId
+            ).trim();
+
+
+        try {
+
+            const result =
+                await pool.query(
+                    `
+                    SELECT
+                        COUNT(*)::INTEGER AS "referralCount",
+                        COALESCE(
+                            SUM(reward),
+                            0
+                        )::NUMERIC AS "referralEarned"
+                    FROM bonk_referrals
+                    WHERE
+                        referrer_id = $1
+                        AND status = 'Completed'
+                    `,
+                    [
+                        userId
+                    ]
+                );
+
+
+            const stats =
+                result.rows[0] || {};
+
+
+            res.json({
+
+                success: true,
+
+                referralCount:
+                    Number(
+                        stats.referralCount || 0
+                    ),
+
+                referralEarned:
+                    Number(
+                        stats.referralEarned || 0
+                    )
+
+            });
+
+        } catch (err) {
+
+            console.error(
+                "Referral Stats Error:",
+                err.message
+            );
+
+
+            res.status(500).json({
+
+                success: false,
+
+                message:
+                    "Database Error"
+
+            });
+
+        }
+
+    }
+);
+
+
+// =====================================================
+// REFERRAL LIST
+// =====================================================
+
+app.get(
+    '/api/bonk/referral/list/:userId',
+    async (req, res) => {
+
+        const userId =
+            String(
+                req.params.userId
+            ).trim();
+
+
+        try {
+
+            const result =
+                await pool.query(
+                    `
+                    SELECT
+                        referred_user_id AS "userId",
+                        reward,
+                        status,
+                        created_at AS "createdAt"
+                    FROM bonk_referrals
+                    WHERE referrer_id = $1
+                    ORDER BY created_at DESC
+                    `,
+                    [
+                        userId
+                    ]
+                );
+
+
+            res.json({
+
+                success: true,
+
+                referrals:
+                    result.rows
+
+            });
+
+        } catch (err) {
+
+            console.error(
+                "Referral List Error:",
+                err.message
+            );
+
+
+            res.status(500).json({
+
+                success: false,
+
+                message:
+                    "Database Error"
+
+            });
+
+        }
+
+    }
+);
+
+// =====================================================
+// 7. REFERRAL STATISTICS
+// =====================================================
+
+app.get(
+    '/api/bonk/referral/stats/:userId',
+    async (req, res) => {
+
+        const {
+            userId
+        } = req.params;
+
+
+        if (!userId) {
+
+            return res.status(400).json({
+
+                success: false,
+
+                message:
+                    "User ID is required"
+
+            });
+
+        }
+
+
+        try {
+
+            const result =
+                await pool.query(
+                    `
+                    SELECT
+                        COUNT(*)::INTEGER AS "referralCount",
+                        COALESCE(
+                            SUM(reward),
+                            0
+                        )::NUMERIC AS "referralEarned"
+                    FROM bonk_referrals
+                    WHERE
+                        referrer_id = $1
+                        AND status = 'Completed';
+                    `,
+                    [
+                        String(userId).trim()
+                    ]
+                );
+
+
+            const stats =
+                result.rows[0] || {};
+
+
+            res.json({
+
+                success: true,
+
+                referralCount:
+                    Number(
+                        stats.referralCount || 0
+                    ),
+
+                referralEarned:
+                    Number(
+                        stats.referralEarned || 0
+                    )
+
+            });
+
+        } catch (err) {
+
+            console.error(
+                "Referral Stats Error:",
+                err.message
+            );
+
+
+            res.status(500).json({
+
+                success: false,
+
+                message:
+                    "Database Error",
+
+                error:
+                    err.message
+
+            });
+
+        }
+
+    }
+);
+
+
+// =====================================================
+// 8. REFERRAL LIST
+// =====================================================
+
+app.get(
+    '/api/bonk/referral/list/:userId',
+    async (req, res) => {
+
+        const {
+            userId
+        } = req.params;
+
+
+        if (!userId) {
+
+            return res.status(400).json({
+
+                success: false,
+
+                message:
+                    "User ID is required"
+
+            });
+
+        }
+
+
+        try {
+
+            const result =
+                await pool.query(
+                    `
+                    SELECT
+                        referred_user_id AS "userId",
+                        reward,
+                        status,
+                        created_at AS "createdAt"
+                    FROM bonk_referrals
+                    WHERE
+                        referrer_id = $1
+                    ORDER BY
+                        created_at DESC;
+                    `,
+                    [
+                        String(userId).trim()
+                    ]
+                );
+
+
+            res.json({
+
+                success: true,
+
+                referrals:
+                    result.rows
+
+            });
+
+        } catch (err) {
+
+            console.error(
+                "Referral List Error:",
+                err.message
+            );
+
+
+            res.status(500).json({
+
+                success: false,
+
+                message:
+                    "Database Error",
+
+                error:
+                    err.message
+
+            });
+
+        }
+
+    }
+);
+
+
+
+// =====================================================
+// 9. BONK WEEKLY CONTEST
+// =====================================================
+const CONTEST_ADMIN_PASSWORD = process.env.CONTEST_ADMIN_PASSWORD;
+const contestTableSql = `
+CREATE TABLE IF NOT EXISTS bonk_weekly_contest (
+    user_id VARCHAR(255) PRIMARY KEY,
+    binance_id VARCHAR(255) NOT NULL,
+    total_ads INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);`;
+
+(async () => {
+    try {
+        await pool.query(contestTableSql);
+        console.log('SUCCESS: BONK weekly contest database ready!');
+    } catch (err) {
+        console.error('Contest database initialization error:', err.message);
+    }
+})();
+
+app.get('/api/bonk/contest/stats/:userId', async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT binance_id AS "binanceId", total_ads AS "totalAds" FROM bonk_weekly_contest WHERE user_id = $1',
+            [String(req.params.userId).trim()]
+        );
+        const row = result.rows[0] || {};
+        res.json({success: true, binanceId: row.binanceId || null, totalAds: Number(row.totalAds || 0)});
+    } catch (err) {
+        res.status(500).json({success: false, message: 'Database Error'});
+    }
+});
+
+app.post('/api/bonk/contest/ad', async (req, res) => {
+    const userId = String(req.body.userId || '').trim();
+    const binanceId = String(req.body.binanceId || '').trim();
+    if (!userId || !/^[0-9]{5,20}$/.test(binanceId)) {
+        return res.status(400).json({success: false, message: 'Valid user ID and Binance UID are required.'});
+    }
+    try {
+        const result = await pool.query(`
+            INSERT INTO bonk_weekly_contest (user_id, binance_id, total_ads)
+            VALUES ($1, $2, 1)
+            ON CONFLICT (user_id)
+            DO UPDATE SET binance_id = EXCLUDED.binance_id,
+                          total_ads = bonk_weekly_contest.total_ads + 1,
+                          updated_at = CURRENT_TIMESTAMP
+            RETURNING binance_id AS "binanceId", total_ads AS "totalAds";
+        `, [userId, binanceId]);
+        res.json({success: true, ...result.rows[0]});
+    } catch (err) {
+        res.status(500).json({success: false, message: 'Database Error'});
+    }
+});
+
+app.get('/api/bonk/contest/leaderboard', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT binance_id AS "binanceId", total_ads AS "totalAds",
+                   RANK() OVER (ORDER BY total_ads DESC, updated_at ASC) AS rank
+            FROM bonk_weekly_contest
+            ORDER BY total_ads DESC, updated_at ASC;
+        `);
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({success: false, message: 'Database Error'});
+    }
+});
+
+app.post('/api/bonk/contest/reset', async (req, res) => {
+    if (!CONTEST_ADMIN_PASSWORD) {
+        return res.status(503).json({success: false, message: 'Admin password is not configured on the server.'});
+    }
+    if (String(req.body.password || '') !== CONTEST_ADMIN_PASSWORD) {
+        return res.status(401).json({success: false, message: 'Invalid admin password.'});
+    }
+    try {
+        await pool.query('UPDATE bonk_weekly_contest SET total_ads = 0, updated_at = CURRENT_TIMESTAMP');
+        res.json({success: true, message: 'Leaderboard reset successfully.'});
+    } catch (err) {
+        res.status(500).json({success: false, message: 'Database Error'});
+    }
+});
+
+
+// =====================================================
+// 10. BONK NFT MEMBERSHIP
+// =====================================================
+const NFT_ADMIN_PASSWORD = process.env.CONTEST_ADMIN_PASSWORD;
+const nftTableSql = `
+CREATE TABLE IF NOT EXISTS bonk_nfts (
+    user_id VARCHAR(255) PRIMARY KEY,
+    nft_id VARCHAR(32) UNIQUE NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'Inactive',
+    activated_at TIMESTAMP NULL,
+    expires_at TIMESTAMP NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);`;
+
+(async () => {
+    try {
+        await pool.query(nftTableSql);
+        console.log('SUCCESS: BONK NFT database ready!');
+    } catch (err) {
+        console.error('NFT database initialization error:', err.message);
+    }
+})();
+
+function createNftId() {
+    const digits = Math.floor(10000 + Math.random() * 90000);
+    return `NFT-${digits}`;
 }
-app.get('/health', (_req,res)=>res.json({status:'Active',app:'USDT Fan Miner API',version:1}));
-app.get('/', (_req,res)=>res.sendFile(require('path').join(__dirname, 'index.html')));
-app.get('/api/config', (_req,res)=>res.json({success:true,depositAddress:DEPOSIT_ADDRESS,minDeposit:MIN_DEPOSIT,maxDeposit:MAX_DEPOSIT,powerPerUsdt:POWER_PER_USDT,powerDays:POWER_DAYS,minWithdrawal:MIN_WITHDRAWAL,network:'BNB Smart Chain (BEP20)',ratePerPowerPerSecond:RATE_PER_POWER_PER_SECOND}));
-app.post('/api/register', async(req,res)=>{
- try { const email=emailNorm(req.body.email); if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({success:false,message:'Enter a valid email address.'});
- await pool.query('INSERT INTO usdt_users(email) VALUES($1) ON CONFLICT(email) DO NOTHING',[email]);
- res.json({success:true,email}); } catch(e){console.error(e);res.status(500).json({success:false,message:'Registration failed.'});}
+
+app.get('/api/bonk/nft/status/:userId', async (req, res) => {
+    const userId = String(req.params.userId || '').trim();
+    if (!userId) return res.status(400).json({success:false, message:'User ID is required.'});
+    try {
+        let result = await pool.query(
+            'SELECT nft_id AS "nftId", status, expires_at AS "expiresAt" FROM bonk_nfts WHERE user_id = $1',
+            [userId]
+        );
+        if (result.rowCount === 0) {
+            let nftId;
+            for (let attempt = 0; attempt < 5; attempt++) {
+                nftId = createNftId();
+                try {
+                    await pool.query(
+                        'INSERT INTO bonk_nfts (user_id, nft_id) VALUES ($1, $2)',
+                        [userId, nftId]
+                    );
+                    break;
+                } catch (err) {
+                    if (err.code !== '23505' || attempt === 4) throw err;
+                }
+            }
+            result = await pool.query(
+                'SELECT nft_id AS "nftId", status, expires_at AS "expiresAt" FROM bonk_nfts WHERE user_id = $1',
+                [userId]
+            );
+        }
+        const row = result.rows[0];
+        const expired = row.status === 'Active' && row.expiresAt && new Date(row.expiresAt).getTime() <= Date.now();
+        if (expired) {
+            await pool.query(
+                "UPDATE bonk_nfts SET status = 'Inactive', activated_at = NULL, expires_at = NULL WHERE user_id = $1",
+                [userId]
+            );
+            return res.json({success:true, nftId:row.nftId, status:'Inactive', active:false, expiresAt:null});
+        }
+        res.json({
+            success:true,
+            nftId:row.nftId,
+            status:row.status,
+            active:row.status === 'Active',
+            expiresAt:row.expiresAt || null
+        });
+    } catch (err) {
+        console.error('NFT status error:', err.message);
+        res.status(500).json({success:false, message:'Database Error'});
+    }
 });
-async function userEmail(req,res,next){ const email=emailNorm(req.body.email || req.query.email); if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({success:false,message:'Valid email is required.'}); req.email=email; next(); }
-app.get('/api/me', userEmail, async(req,res)=>{
- try {
-  const u=await pool.query('SELECT email,created_at FROM usdt_users WHERE email=$1',[req.email]); if(!u.rowCount) return res.status(404).json({success:false,message:'Email not registered. Register again.'});
-  const p=await pool.query('SELECT COALESCE(SUM(amount),0) AS power FROM usdt_power WHERE email=$1 AND expires_at>NOW()',[req.email]);
-  const expires=await pool.query('SELECT id,amount,expires_at FROM usdt_power WHERE email=$1 AND expires_at>NOW() ORDER BY expires_at',[req.email]);
-  const dep=await pool.query("SELECT COALESCE(SUM(amount),0) AS total FROM usdt_deposits WHERE email=$1 AND status='Approved'",[req.email]);
-  const wd=await pool.query("SELECT COALESCE(SUM(amount),0) AS total FROM usdt_withdrawals WHERE email=$1 AND status IN ('Pending','Approved')",[req.email]);
-  const power=Number(p.rows[0].power||0); const seconds=expires.rows.reduce((n,r)=>n+Math.max(0,(new Date(r.expires_at)-Date.now())/1000),0);
-  res.json({success:true,email:req.email,activePower:power,approvedDeposits:Number(dep.rows[0].total||0),reservedWithdrawals:Number(wd.rows[0].total||0),estimatedRatePerSecond:power*RATE_PER_POWER_PER_SECOND,powerLots:expires.rows,createdAt:u.rows[0].created_at,disclaimer:'Mining estimates are illustrative only; no earnings or payout is guaranteed.'});
- } catch(e){console.error(e);res.status(500).json({success:false,message:'Could not load account.'});}
+
+app.post('/api/bonk/nft/activate', async (req, res) => {
+    const nftId = String(req.body.nftId || '').trim().toUpperCase();
+    const password = String(req.body.password || '');
+    if (!NFT_ADMIN_PASSWORD) {
+        return res.status(503).json({success:false, message:'Admin password is not configured on the server.'});
+    }
+    if (password !== NFT_ADMIN_PASSWORD) {
+        return res.status(401).json({success:false, message:'Invalid admin password.'});
+    }
+    if (!/^NFT-[A-Z0-9]{5,20}$/.test(nftId)) {
+        return res.status(400).json({success:false, message:'Invalid NFT ID.'});
+    }
+    try {
+        const result = await pool.query(`
+            UPDATE bonk_nfts
+            SET status = 'Active',
+                activated_at = CURRENT_TIMESTAMP,
+                expires_at = CURRENT_TIMESTAMP + INTERVAL '1 month'
+            WHERE nft_id = $1
+            RETURNING nft_id AS "nftId", status, expires_at AS "expiresAt";
+        `, [nftId]);
+        if (result.rowCount === 0) {
+            return res.status(404).json({success:false, message:'NFT ID not found.'});
+        }
+        res.json({success:true, ...result.rows[0], message:'NFT activated for 1 month.'});
+    } catch (err) {
+        console.error('NFT activation error:', err.message);
+        res.status(500).json({success:false, message:'Database Error'});
+    }
 });
-app.post('/api/deposits', userEmail, async(req,res)=>{
- try { const amount=Number(req.body.amount); const txid=String(req.body.txid||'').trim();
- if(!Number.isFinite(amount)||amount<MIN_DEPOSIT||amount>MAX_DEPOSIT) return res.status(400).json({success:false,message:`Deposit must be ${MIN_DEPOSIT}–${MAX_DEPOSIT} USDT.`});
- if(txid.length<20||txid.length>180||! /^[a-zA-Z0-9xX_-]+$/.test(txid)) return res.status(400).json({success:false,message:'Enter a valid transaction hash / TXID.'});
- const user=await pool.query('SELECT email FROM usdt_users WHERE email=$1',[req.email]); if(!user.rowCount) return res.status(404).json({success:false,message:'Register your email first.'});
- const depositId=id(); await pool.query('INSERT INTO usdt_deposits(id,email,amount,txid) VALUES($1,$2,$3,$4)',[depositId,req.email,amount,txid]);
- await pool.query("INSERT INTO usdt_history(email,kind,amount,detail) VALUES($1,'Deposit submitted',$2,$3)",[req.email,amount,`TXID ${txid}; awaiting manual review`]);
- res.json({success:true,message:'Deposit submitted for manual review.',id:depositId,status:'Pending'});
- } catch(e){ if(e.code==='23505') return res.status(409).json({success:false,message:'This TXID has already been submitted.'}); console.error(e);res.status(500).json({success:false,message:'Could not submit deposit.'}); }
+
+// =====================================================
+// 11. BONK NFT ADMIN PANEL
+// =====================================================
+// Open this page in a browser:
+// https://YOUR-RENDER-DOMAIN.onrender.com/admin
+// =====================================================
+
+app.get('/admin', (req, res) => {
+    res.type('html').send(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BONK NFT Admin Panel</title>
+<style>
+body{font-family:Arial,sans-serif;background:#111;color:#fff;max-width:520px;margin:40px auto;padding:20px}
+.card{background:#1d1d1d;padding:24px;border-radius:16px;box-shadow:0 0 20px #000}
+h1{color:#ffcc00;font-size:25px}
+label{display:block;margin-top:16px;margin-bottom:6px}
+input,button{width:100%;box-sizing:border-box;padding:13px;border-radius:9px;border:1px solid #555;font-size:16px}
+input{background:#292929;color:#fff}
+button{margin-top:20px;background:#ffcc00;color:#111;border:0;font-weight:bold;cursor:pointer}
+#result{margin-top:18px;white-space:pre-wrap;line-height:1.5}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>🟡 BONK NFT Admin Panel</h1>
+<p>Activate a user's NFT for 1 month.</p>
+<form id="activateForm">
+<label for="nftId">NFT ID</label>
+<input id="nftId" name="nftId" placeholder="NFT-99599" required>
+<label for="password">Admin Password</label>
+<input id="password" name="password" type="password" placeholder="Enter admin password" required>
+<button type="submit">Activate NFT</button>
+</form>
+<div id="result"></div>
+</div>
+<script>
+document.getElementById('activateForm').addEventListener('submit', async function(event){
+    event.preventDefault();
+    const resultBox = document.getElementById('result');
+    resultBox.textContent = 'Processing...';
+    const nftId = document.getElementById('nftId').value.trim();
+    const password = document.getElementById('password').value;
+    try {
+        const response = await fetch('/api/bonk/nft/activate', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+            body: JSON.stringify({nftId, password})
+        });
+        const data = await response.json();
+        resultBox.textContent = data.success
+            ? 'Success: ' + data.message + '\\nNFT: ' + data.nftId + '\\nExpires: ' + (data.expiresAt || 'N/A')
+            : 'Error: ' + (data.message || 'Request failed');
+    } catch (error) {
+        resultBox.textContent = 'Network error: ' + error.message;
+    }
 });
-app.post('/api/withdrawals', userEmail, async(req,res)=>{
- try {const amount=Number(req.body.amount); const wallet=String(req.body.wallet||'').trim();
- if(!Number.isFinite(amount)||amount<MIN_WITHDRAWAL) return res.status(400).json({success:false,message:`Minimum withdrawal is ${MIN_WITHDRAWAL} USDT.`});
- if(!/^0x[a-fA-F0-9]{40}$/.test(wallet)) return res.status(400).json({success:false,message:'Enter a valid BEP20 wallet address.'});
- const client=await pool.connect(); try {await client.query('BEGIN'); const p=await client.query('SELECT COALESCE(SUM(amount),0) AS power FROM usdt_power WHERE email=$1 AND expires_at>NOW()',[req.email]); const dep=await client.query("SELECT COALESCE(SUM(amount),0) AS total FROM usdt_deposits WHERE email=$1 AND status='Approved'",[req.email]); const w=await client.query("SELECT COALESCE(SUM(amount),0) AS total FROM usdt_withdrawals WHERE email=$1 AND status IN ('Pending','Approved')",[req.email]);
- // Withdrawal eligibility is limited to the approved deposit balance; mining estimates are not withdrawable funds.
- const available=Math.max(0,Number(dep.rows[0].total)-Number(w.rows[0].total)); if(amount>available){await client.query('ROLLBACK');return res.status(400).json({success:false,message:`Available approved deposit balance is ${available.toFixed(4)} USDT. Mining estimates are not withdrawable.`});}
- const wid=id(); await client.query('INSERT INTO usdt_withdrawals(id,email,amount,wallet) VALUES($1,$2,$3,$4)',[wid,req.email,amount,wallet]); await client.query("INSERT INTO usdt_history(email,kind,amount,detail) VALUES($1,'Withdrawal requested',$2,$3)",[req.email,amount,`BEP20 wallet ${wallet}; pending manual review`]); await client.query('COMMIT'); res.json({success:true,message:'Withdrawal request submitted. Approval does not send funds automatically.',id:wid,status:'Pending'});
- } catch(e){await client.query('ROLLBACK');throw e;} finally{client.release();}
- } catch(e){console.error(e);res.status(500).json({success:false,message:'Could not submit withdrawal.'});}
+</script>
+</body>
+</html>`);
 });
-app.get('/api/history', userEmail, async(req,res)=>{try{const r=await pool.query('SELECT id,kind,amount,detail,created_at FROM usdt_history WHERE email=$1 ORDER BY created_at DESC LIMIT 100',[req.email]);res.json({success:true,items:r.rows});}catch(e){console.error(e);res.status(500).json({success:false,message:'Could not load history.'});}});
-app.get('/api/admin/overview', adminOnly, async(_req,res)=>{try{const [users,deposits,power,withdrawals]=await Promise.all([pool.query('SELECT email,created_at FROM usdt_users ORDER BY created_at DESC LIMIT 500'),pool.query('SELECT * FROM usdt_deposits ORDER BY created_at DESC LIMIT 500'),pool.query('SELECT * FROM usdt_power ORDER BY created_at DESC LIMIT 500'),pool.query('SELECT * FROM usdt_withdrawals ORDER BY created_at DESC LIMIT 500')]);res.json({success:true,users:users.rows,deposits:deposits.rows,power:power.rows,withdrawals:withdrawals.rows});}catch(e){console.error(e);res.status(500).json({success:false,message:'Admin overview failed.'});}});
-app.post('/api/admin/deposits/:id/review', adminOnly, async(req,res)=>{const status=String(req.body.status||'');const note=String(req.body.note||'').slice(0,500);if(!['Approved','Rejected'].includes(status))return res.status(400).json({success:false,message:'Status must be Approved or Rejected.'});const client=await pool.connect();try{await client.query('BEGIN');const d=await client.query('SELECT * FROM usdt_deposits WHERE id=$1 FOR UPDATE',[req.params.id]);if(!d.rowCount){await client.query('ROLLBACK');return res.status(404).json({success:false,message:'Deposit not found.'});}if(d.rows[0].status!=='Pending'){await client.query('ROLLBACK');return res.status(409).json({success:false,message:'Deposit has already been reviewed.'});}await client.query('UPDATE usdt_deposits SET status=$1,admin_note=$2,reviewed_at=NOW() WHERE id=$3',[status,note,req.params.id]);if(status==='Approved'){const power=Number(d.rows[0].amount)*POWER_PER_USDT;const expiry=new Date(Date.now()+POWER_DAYS*86400000);await client.query('INSERT INTO usdt_power(id,email,amount,source_deposit_id,expires_at) VALUES($1,$2,$3,$4,$5)',[id(),d.rows[0].email,power,req.params.id,expiry]);await client.query("INSERT INTO usdt_history(email,kind,amount,detail) VALUES($1,'Power added',$2,$3)",[d.rows[0].email,power,`${POWER_PER_USDT} Power per USDT; expires ${expiry.toISOString()}`]);}await client.query("INSERT INTO usdt_history(email,kind,amount,detail) VALUES($1,$2,$3,$4)",[d.rows[0].email,`Deposit ${status.toLowerCase()}`,d.rows[0].amount,note||`Admin marked ${status}`]);await client.query('COMMIT');res.json({success:true,message:`Deposit ${status.toLowerCase()}.`});}catch(e){await client.query('ROLLBACK');console.error(e);res.status(500).json({success:false,message:'Review failed.'});}finally{client.release();}});
-app.post('/api/admin/power', adminOnly, async(req,res)=>{try{const email=emailNorm(req.body.email);const amount=Number(req.body.amount);const days=Number(req.body.days||POWER_DAYS);if(!email||!Number.isFinite(amount)||amount<=0||!Number.isInteger(days)||days<1||days>365)return res.status(400).json({success:false,message:'Enter valid email, positive Power amount and 1–365 days.'});const u=await pool.query('SELECT email FROM usdt_users WHERE email=$1',[email]);if(!u.rowCount)return res.status(404).json({success:false,message:'User email is not registered.'});const expiry=new Date(Date.now()+days*86400000);await pool.query('INSERT INTO usdt_power(id,email,amount,expires_at) VALUES($1,$2,$3,$4)',[id(),email,amount,expiry]);await pool.query("INSERT INTO usdt_history(email,kind,amount,detail) VALUES($1,'Admin Power added',$2,$3)",[email,amount,`Manual admin addition; expires ${expiry.toISOString()}`]);res.json({success:true,message:`Added ${amount} Power for ${days} days.`,expiresAt:expiry});}catch(e){console.error(e);res.status(500).json({success:false,message:'Could not add Power.'});}});
-app.post('/api/admin/withdrawals/:id/review', adminOnly, async(req,res)=>{try{const status=String(req.body.status||'');const note=String(req.body.note||'').slice(0,500);if(!['Approved','Rejected'].includes(status))return res.status(400).json({success:false,message:'Status must be Approved or Rejected.'});const r=await pool.query("UPDATE usdt_withdrawals SET status=$1,admin_note=$2,reviewed_at=NOW() WHERE id=$3 AND status='Pending' RETURNING *",[status,note,req.params.id]);if(!r.rowCount)return res.status(404).json({success:false,message:'Pending withdrawal not found.'});await pool.query("INSERT INTO usdt_history(email,kind,amount,detail) VALUES($1,$2,$3,$4)",[r.rows[0].email,`Withdrawal ${status.toLowerCase()}`,r.rows[0].amount,note||`Admin marked ${status}; funds are not transferred automatically`]);res.json({success:true,message:`Withdrawal ${status.toLowerCase()}. This action does not transfer funds on-chain.`});}catch(e){console.error(e);res.status(500).json({success:false,message:'Review failed.'});}});
-app.use((err,_req,res,_next)=>{console.error(err);res.status(500).json({success:false,message:'Unexpected server error.'});});
-initDb().then(()=>app.listen(PORT,()=>console.log(`USDT Fan Miner API listening on ${PORT}`))).catch(e=>{console.error('Database startup failed:',e);process.exit(1);});
+
+// =====================================================
+// SERVER START
+// =====================================================
+
+app.listen(
+    PORT,
+    () => {
+
+        console.log(
+            `Server running on port ${PORT}`
+        );
+
+    }
+);
