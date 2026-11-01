@@ -211,7 +211,7 @@ const withdrawHandler = async (
 
     const cleanTokenType = String(tokenType || req.body.token_type || 'GRAM').toUpperCase();
     const numericAmount = Number(amount);
-    const minimumAmount = cleanTokenType === 'GRAM' ? 0.01 : 2000;
+    const minimumAmount = cleanTokenType === 'GRAM' ? 0.005 : 2000;
 
     if (
         !binanceId ||
