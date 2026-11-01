@@ -36,8 +36,8 @@ const initDb = async () => {
                 binance_id VARCHAR(255),
                 wallet VARCHAR(255),
                 amount NUMERIC NOT NULL,
-                type VARCHAR(50) DEFAULT 'Binance',
-                token_type VARCHAR(50) DEFAULT 'BONK',
+                type VARCHAR(50) DEFAULT 'GRAM Address',
+                token_type VARCHAR(50) DEFAULT 'GRAM',
                 total_deduct NUMERIC DEFAULT 0,
                 status VARCHAR(50) DEFAULT 'Pending',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -50,8 +50,8 @@ const initDb = async () => {
             ADD COLUMN IF NOT EXISTS user_id VARCHAR(255),
             ADD COLUMN IF NOT EXISTS binance_id VARCHAR(255),
             ADD COLUMN IF NOT EXISTS wallet VARCHAR(255),
-            ADD COLUMN IF NOT EXISTS type VARCHAR(50) DEFAULT 'Binance',
-            ADD COLUMN IF NOT EXISTS token_type VARCHAR(50) DEFAULT 'BONK',
+            ADD COLUMN IF NOT EXISTS type VARCHAR(50) DEFAULT 'GRAM Address',
+            ADD COLUMN IF NOT EXISTS token_type VARCHAR(50) DEFAULT 'GRAM',
             ADD COLUMN IF NOT EXISTS total_deduct NUMERIC DEFAULT 0,
             ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 
@@ -73,7 +73,7 @@ const initDb = async () => {
                 referrer_id VARCHAR(255) NOT NULL,
                 referred_user_id VARCHAR(255) NOT NULL UNIQUE,
                 referral_code VARCHAR(255) NOT NULL,
-                reward NUMERIC NOT NULL DEFAULT 300,
+                reward NUMERIC NOT NULL DEFAULT 0.0007,
                 status VARCHAR(50) NOT NULL DEFAULT 'Completed',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -109,7 +109,7 @@ const initDb = async () => {
         );
 
         console.log(
-            "SUCCESS: BONK referral system database ready!"
+            "SUCCESS: GRAM referral system database ready!"
         );
 
     } catch (err) {
@@ -209,11 +209,14 @@ const withdrawHandler = async (
         totalDeduct
     } = req.body;
 
+    const cleanTokenType = String(tokenType || req.body.token_type || 'GRAM').toUpperCase();
+    const numericAmount = Number(amount);
+    const minimumAmount = cleanTokenType === 'GRAM' ? 0.01 : 2000;
 
     if (
         !binanceId ||
-        !amount ||
-        amount < 2000
+        !Number.isFinite(numericAmount) ||
+        numericAmount < minimumAmount
     ) {
 
         return res.status(400).json({
@@ -247,13 +250,13 @@ const withdrawHandler = async (
     const finalType =
         type ||
         req.body.type ||
-        'Binance';
+        'GRAM Address';
 
 
     const finalTokenType =
         tokenType ||
         req.body.token_type ||
-        'BONK';
+        'GRAM';
 
 
     const finalDeduct =
@@ -300,9 +303,9 @@ const withdrawHandler = async (
                 finalUserId,
                 binanceId,
                 finalWallet,
-                amount,
+                numericAmount,
                 finalType,
-                finalTokenType,
+                cleanTokenType,
                 finalDeduct,
                 'Pending'
             ]
@@ -361,7 +364,29 @@ app.post(
 
 
 // =====================================================
-// 3. GET BONK WITHDRAWALS
+// USER GRAM WITHDRAWAL HISTORY
+// =====================================================
+app.get('/api/gram/withdrawals/:userId', async (req, res) => {
+    const userId = String(req.params.userId || '').trim();
+    if (!userId) return res.status(400).json({success:false,message:'User ID is required'});
+    try {
+        const result = await pool.query(`
+            SELECT id, amount, status, wallet, binance_id AS "gramAddress",
+                   created_at AS "createdAt"
+            FROM withdrawals
+            WHERE user_id = $1 AND UPPER(token_type) = 'GRAM'
+            ORDER BY created_at DESC
+            LIMIT 100
+        `, [userId]);
+        res.json({success:true,withdrawals:result.rows});
+    } catch (err) {
+        console.error('GRAM withdrawal history error:',err.message);
+        res.status(500).json({success:false,message:'Could not load withdrawal history'});
+    }
+});
+
+// =====================================================
+// 3. GET GRAM WITHDRAWALS
 // =====================================================
 
 app.get(
@@ -382,9 +407,7 @@ app.get(
                     status,
                     created_at AS "createdAt"
                 FROM withdrawals
-                WHERE
-                    UPPER(token_type) = 'BONK'
-                    OR token_type IS NULL
+                WHERE UPPER(token_type) = 'GRAM'
                 ORDER BY created_at DESC;
             `;
 
@@ -600,7 +623,7 @@ app.put(
 // 6. BONK REFERRAL SYSTEM
 // =====================================================
 
-const REFERRAL_REWARD = 300;
+const REFERRAL_REWARD = 0.0007;
 
 
 // =====================================================
@@ -616,7 +639,7 @@ const initReferralDb = async () => {
                 referrer_id VARCHAR(255) NOT NULL,
                 referred_user_id VARCHAR(255) NOT NULL UNIQUE,
                 referral_code VARCHAR(255) NOT NULL,
-                reward NUMERIC NOT NULL DEFAULT 300,
+                reward NUMERIC NOT NULL DEFAULT 0.0007,
                 status VARCHAR(50) NOT NULL DEFAULT 'Completed',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -653,9 +676,19 @@ const initReferralDb = async () => {
             );
         `);
 
+        // Rebase any unclaimed legacy GRAM referral credits to the new GRAM reward.
+        await pool.query(`
+            UPDATE bonk_referral_rewards r
+            SET pending_reward = COALESCE((
+                SELECT COUNT(*) * 0.0007
+                FROM bonk_referrals b
+                WHERE b.referrer_id = r.user_id AND b.status = 'Completed'
+            ), 0), updated_at = CURRENT_TIMESTAMP
+        `);
+
 
         console.log(
-            "SUCCESS: BONK referral database ready!"
+            "SUCCESS: GRAM referral database ready!"
         );
 
     } catch (err) {
@@ -1467,7 +1500,7 @@ CREATE TABLE IF NOT EXISTS bonk_weekly_contest (
 (async () => {
     try {
         await pool.query(contestTableSql);
-        console.log('SUCCESS: BONK weekly contest database ready!');
+        console.log('SUCCESS: GRAM weekly contest database ready!');
     } catch (err) {
         console.error('Contest database initialization error:', err.message);
     }
@@ -1539,7 +1572,7 @@ app.post('/api/bonk/contest/reset', async (req, res) => {
 
 
 // =====================================================
-// 10. BONK NFT MEMBERSHIP
+// 10. GRAM NFT MEMBERSHIP
 // =====================================================
 const NFT_ADMIN_PASSWORD = process.env.CONTEST_ADMIN_PASSWORD;
 const nftTableSql = `
@@ -1555,7 +1588,7 @@ CREATE TABLE IF NOT EXISTS bonk_nfts (
 (async () => {
     try {
         await pool.query(nftTableSql);
-        console.log('SUCCESS: BONK NFT database ready!');
+        console.log('SUCCESS: GRAM NFT database ready!');
     } catch (err) {
         console.error('NFT database initialization error:', err.message);
     }
@@ -1647,7 +1680,7 @@ app.post('/api/bonk/nft/activate', async (req, res) => {
 });
 
 // =====================================================
-// 11. BONK NFT ADMIN PANEL
+// 11. GRAM NFT ADMIN PANEL
 // =====================================================
 // Open this page in a browser:
 // https://YOUR-RENDER-DOMAIN.onrender.com/admin
@@ -1659,7 +1692,7 @@ app.get('/admin', (req, res) => {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>BONK NFT Admin Panel</title>
+<title>GRAM Admin Panel</title>
 <style>
 body{font-family:Arial,sans-serif;background:#111;color:#fff;max-width:520px;margin:40px auto;padding:20px}
 .card{background:#1d1d1d;padding:24px;border-radius:16px;box-shadow:0 0 20px #000}
@@ -1673,7 +1706,7 @@ button{margin-top:20px;background:#ffcc00;color:#111;border:0;font-weight:bold;c
 </head>
 <body>
 <div class="card">
-<h1>🟡 BONK NFT Admin Panel</h1>
+<h1>🟡 GRAM Admin Panel</h1>
 <p>Activate a user's NFT for 1 month.</p>
 <form id="activateForm">
 <label for="nftId">NFT ID</label>
