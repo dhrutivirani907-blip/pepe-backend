@@ -16,7 +16,11 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
-app.use(cors({ origin: '*', methods: ['GET','POST','PUT','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Admin-Password']
+}));
 app.use(express.json({ limit: '1mb' }));
 
 const COIN_RATES = { 10: 1500, 20: 3000, 50: 7500, 100: 15000 };
