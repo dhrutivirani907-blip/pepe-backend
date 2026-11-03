@@ -25,7 +25,7 @@ app.use(express.json({ limit: '1mb' }));
 
 const COIN_RATES = { 10: 1500, 20: 3000, 50: 7500, 100: 15000 };
 const REFERRAL_REWARD = 100;
-const WELCOME_BONUS = 3000;
+const WELCOME_BONUS = 0;
 const SUPER_OFFER_GEM_COST = 25;
 
 async function initDb() {
