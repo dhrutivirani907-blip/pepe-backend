@@ -21,6 +21,7 @@ app.use(express.json({ limit: '1mb' }));
 
 const COIN_RATES = { 10: 1500, 20: 3000, 50: 7500, 100: 15000 };
 const REFERRAL_REWARD = 100;
+const WELCOME_BONUS = 3000;
 const SUPER_OFFER_GEM_COST = 25;
 
 async function initDb() {
@@ -118,16 +119,18 @@ app.post('/api/auth', async (req,res) => {
   try {
     await client.query('BEGIN');
     const exists = await client.query('SELECT user_id FROM app_users WHERE user_id=$1 FOR UPDATE',[userId]);
+    let isNewUser = false;
     if (exists.rowCount) {
       await client.query('UPDATE app_users SET name=$2,email=$3,updated_at=NOW() WHERE user_id=$1',[userId,name,email]);
     } else {
+      isNewUser = true;
       const ownCode = 'R' + crypto.randomBytes(5).toString('hex').toUpperCase();
       let referrer = null;
       if (referralCode) {
         const found = await client.query('SELECT user_id FROM app_users WHERE referral_code=$1',[referralCode]);
         if (found.rowCount && found.rows[0].user_id !== userId) referrer = found.rows[0].user_id;
       }
-      await client.query(`INSERT INTO app_users(user_id,name,email,referral_code,referred_by) VALUES($1,$2,$3,$4,$5)`,[userId,name,email,ownCode,referrer]);
+      await client.query(`INSERT INTO app_users(user_id,name,email,coins,referral_code,referred_by) VALUES($1,$2,$3,$4,$5,$6)`,[userId,name,email,WELCOME_BONUS,ownCode,referrer]);
       if (referrer) {
         await client.query('UPDATE app_users SET coins=coins+$2,updated_at=NOW() WHERE user_id=$1',[referrer,REFERRAL_REWARD]);
         await client.query('INSERT INTO app_referrals(referrer_id,referred_id,reward) VALUES($1,$2,$3) ON CONFLICT(referred_id) DO NOTHING',[referrer,userId,REFERRAL_REWARD]);
@@ -135,7 +138,7 @@ app.post('/api/auth', async (req,res) => {
     }
     const u = await client.query('SELECT user_id AS "userId",name,email,coins,gems,referral_code AS "referralCode" FROM app_users WHERE user_id=$1',[userId]);
     await client.query('COMMIT');
-    res.json({success:true,user:u.rows[0]});
+    res.json({success:true,user:u.rows[0],isNewUser,welcomeBonus:isNewUser?WELCOME_BONUS:0});
   } catch(e) { await client.query('ROLLBACK'); console.error('auth',e); res.status(500).json({success:false,message:e.code==='23505'?'This email is already registered to another account.':'Could not sign in.'}); }
   finally { client.release(); }
 });
@@ -181,13 +184,33 @@ app.post('/api/game/start', userOnly, async (req,res)=>{
 app.post('/api/game/ball/start', userOnly, async (req,res)=>{
   const sessionId=String(req.body.sessionId||''); const ball=Number(req.body.ballIndex);
   if(!Number.isInteger(ball)||ball<0||ball>3)return res.status(400).json({success:false,message:'Invalid ball.'});
-  try{const s=await pool.query('SELECT id,claimed FROM app_game_sessions WHERE id=$1 AND user_id=$2',[sessionId,req.userId]);if(!s.rowCount||s.rows[0].claimed)return res.status(400).json({success:false,message:'Game session is not active.'});await pool.query('INSERT INTO app_game_ball_visits(session_id,ball_index) VALUES($1,$2) ON CONFLICT(session_id,ball_index) DO NOTHING',[sessionId,ball]);const v=await pool.query('SELECT completed_at FROM app_game_ball_visits WHERE session_id=$1 AND ball_index=$2',[sessionId,ball]);res.json({success:true,completed:Boolean(v.rows[0].completed_at)});}catch(e){res.status(500).json({success:false,message:'Could not start ball visit.'});}
+  try{
+    const s=await pool.query('SELECT id,claimed FROM app_game_sessions WHERE id=$1 AND user_id=$2',[sessionId,req.userId]);
+    if(!s.rowCount||s.rows[0].claimed)return res.status(400).json({success:false,message:'Game session is not active.'});
+    const old=await pool.query('SELECT completed_at FROM app_game_ball_visits WHERE session_id=$1 AND ball_index=$2',[sessionId,ball]);
+    if(old.rowCount&&old.rows[0].completed_at)return res.json({success:true,completed:true});
+    // A retry after an early return starts a fresh server-side 8-second window.
+    await pool.query(`INSERT INTO app_game_ball_visits(session_id,ball_index,opened_at,completed_at) VALUES($1,$2,NOW(),NULL)
+      ON CONFLICT(session_id,ball_index) DO UPDATE SET opened_at=NOW(),completed_at=NULL`,[sessionId,ball]);
+    res.json({success:true,completed:false});
+  }catch(e){console.error('ball start',e);res.status(500).json({success:false,message:'Could not start ball visit.'});}
 });
 app.post('/api/game/ball/complete', userOnly, async (req,res)=>{
   const sessionId=String(req.body.sessionId||''); const ball=Number(req.body.ballIndex);
   if(!Number.isInteger(ball)||ball<0||ball>3)return res.status(400).json({success:false,message:'Invalid ball.'});
-  try{const v=await pool.query(`UPDATE app_game_ball_visits SET completed_at=NOW() WHERE session_id=$1 AND ball_index=$2 AND completed_at IS NULL AND opened_at<=NOW()-INTERVAL '8 seconds' RETURNING ball_index`,[sessionId,ball]);if(!v.rowCount){const exists=await pool.query('SELECT opened_at,completed_at FROM app_game_ball_visits WHERE session_id=$1 AND ball_index=$2',[sessionId,ball]);if(exists.rowCount&&exists.rows[0].completed_at)return res.json({success:true,completed:true});return res.status(400).json({success:false,message:'You must stay on this page for at least 8 seconds.'});}res.json({success:true,completed:true});}catch(e){res.status(500).json({success:false,message:'Could not verify ball visit.'});}
+  try{
+    const s=await pool.query('SELECT id FROM app_game_sessions WHERE id=$1 AND user_id=$2 AND claimed=FALSE',[sessionId,req.userId]);
+    if(!s.rowCount)return res.status(400).json({success:false,message:'Game session is not active.'});
+    const v=await pool.query(`UPDATE app_game_ball_visits SET completed_at=NOW() WHERE session_id=$1 AND ball_index=$2 AND completed_at IS NULL AND opened_at<=NOW()-INTERVAL '8 seconds' RETURNING ball_index`,[sessionId,ball]);
+    if(!v.rowCount){
+      const exists=await pool.query('SELECT completed_at FROM app_game_ball_visits WHERE session_id=$1 AND ball_index=$2',[sessionId,ball]);
+      if(exists.rowCount&&exists.rows[0].completed_at)return res.json({success:true,completed:true});
+      return res.status(400).json({success:false,message:'You did not stay for at least 8 seconds. This ball is not complete.'});
+    }
+    res.json({success:true,completed:true});
+  }catch(e){console.error('ball complete',e);res.status(500).json({success:false,message:'Could not verify ball visit.'});}
 });
+
 app.post('/api/game/claim', userOnly, async (req,res)=>{
   const id=String(req.body.sessionId||''); const client=await pool.connect();
   try{await client.query('BEGIN');const s=await client.query('SELECT id,claimed FROM app_game_sessions WHERE id=$1 AND user_id=$2 FOR UPDATE',[id,req.userId]);if(!s.rowCount){await client.query('ROLLBACK');return res.status(400).json({success:false,message:'Game session not found.'});}if(s.rows[0].claimed){await client.query('ROLLBACK');return res.status(409).json({success:false,message:'This game reward was already claimed.'});}const count=await client.query('SELECT COUNT(*)::int AS n FROM app_game_ball_visits WHERE session_id=$1 AND completed_at IS NOT NULL',[id]);if(count.rows[0].n!==4){await client.query('ROLLBACK');return res.status(400).json({success:false,message:'Complete all four verified 8-second visits first.'});}await client.query('UPDATE app_game_sessions SET claimed=TRUE,completed_at=NOW() WHERE id=$1',[id]);await client.query('UPDATE app_users SET gems=gems+1,updated_at=NOW() WHERE user_id=$1',[req.userId]);const u=await client.query('SELECT coins,gems FROM app_users WHERE user_id=$1',[req.userId]);await client.query('COMMIT');res.json({success:true,gemsAdded:1,balance:u.rows[0]});}
