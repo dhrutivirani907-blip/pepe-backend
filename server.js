@@ -271,6 +271,21 @@ app.get('/api/user/:userId', userOnly, async (req,res) => {
   } catch(e) { res.status(500).json({success:false,message:'Could not load account.'}); }
 });
 
+// Profile details for the signed-in user. Uses the existing session token and user ID.
+app.get('/api/profile', userOnly, async (req,res) => {
+  try {
+    const r = await pool.query(
+      'SELECT user_id AS "userId", name, email FROM app_users WHERE user_id=$1',
+      [req.userId]
+    );
+    if (!r.rowCount) return res.status(404).json({success:false,message:'Profile not found.'});
+    return res.json({success:true,profile:r.rows[0]});
+  } catch (e) {
+    console.error('profile',e);
+    return res.status(500).json({success:false,message:'Could not load your profile.'});
+  }
+});
+
 app.get('/api/redeems/:userId', userOnly, async (req,res) => {
   try { const r=await pool.query(`SELECT id,amount_inr AS amount,coins_deducted AS "coinsDeducted",status,redeem_code AS "redeemCode",created_at AS "createdAt",updated_at AS "updatedAt" FROM app_redeem_requests WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100`,[cleanId(req.params.userId)]); res.json({success:true,requests:r.rows}); }
   catch(e){res.status(500).json({success:false,message:'Could not load redeem history.'});}
