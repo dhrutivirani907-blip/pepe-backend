@@ -239,6 +239,30 @@ app.post('/api/auth/logout', userOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, message: 'Could not log out.' }); }
 });
 
+// Restore the current account directly from its bearer token.
+app.get('/api/auth/me', async (req,res) => {
+  const header = String(req.headers.authorization || '');
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  if (!token) return res.status(401).json({success:false,message:'No saved login session.'});
+  try {
+    const tokenHash = hashToken(token);
+    const r = await pool.query(
+      `SELECT u.user_id AS "userId",u.name,u.email,u.coins,u.gems,
+              u.referral_code AS "referralCode"
+       FROM app_sessions s
+       JOIN app_users u ON u.user_id=s.user_id
+       WHERE s.token_hash=$1 AND s.expires_at>NOW()
+       LIMIT 1`,
+      [tokenHash]
+    );
+    if (!r.rowCount) return res.status(401).json({success:false,message:'Your login session has expired. Please log in again.'});
+    return res.json({success:true,user:r.rows[0]});
+  } catch (e) {
+    console.error('session restore',e);
+    return res.status(500).json({success:false,message:'Could not restore your account. Please try again.'});
+  }
+});
+
 app.get('/api/user/:userId', userOnly, async (req,res) => {
   try {
     const r = await pool.query('SELECT user_id AS "userId",name,email,coins,gems,referral_code AS "referralCode" FROM app_users WHERE user_id=$1',[cleanId(req.params.userId)]);
