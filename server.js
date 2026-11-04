@@ -279,20 +279,44 @@ app.get('/api/redeems/:userId', userOnly, async (req,res) => {
 app.post('/api/redeems', userOnly, async (req,res) => {
   const amount = Number(req.body.amount);
   const coins = COIN_RATES[amount];
+  const name = String(req.body.name || '').trim().slice(0,120);
+  const email = normalizeEmail(req.body.email);
   if (!coins) return res.status(400).json({success:false,message:'Choose a valid redeem amount.'});
+  if (name.length < 2 || !validEmail(email)) {
+    return res.status(400).json({success:false,message:'Enter a valid name and email address.'});
+  }
+
   const client=await pool.connect();
   try {
     await client.query('BEGIN');
-    const ur=await client.query('SELECT name,email,coins FROM app_users WHERE user_id=$1 FOR UPDATE',[req.userId]);
-    if(!ur.rowCount){await client.query('ROLLBACK');return res.status(404).json({success:false,message:'Account not found. Please sign in again.'});}
-    if(Number(ur.rows[0].coins)<coins){await client.query('ROLLBACK');return res.status(400).json({success:false,message:'Not enough coins for this redeem amount.'});}
+    const ur=await client.query('SELECT coins FROM app_users WHERE user_id=$1 FOR UPDATE',[req.userId]);
+    if(!ur.rowCount){
+      await client.query('ROLLBACK');
+      return res.status(404).json({success:false,message:'Account not found. Please sign in again.'});
+    }
+    if(Number(ur.rows[0].coins)<coins){
+      await client.query('ROLLBACK');
+      return res.status(400).json({success:false,message:'Not enough coins for this redeem amount.'});
+    }
+
     await client.query('UPDATE app_users SET coins=coins-$2,updated_at=NOW() WHERE user_id=$1',[req.userId,coins]);
-    const rr=await client.query(`INSERT INTO app_redeem_requests(user_id,name,email,amount_inr,coins_deducted) VALUES($1,$2,$3,$4,$5) RETURNING id,amount_inr AS amount,coins_deducted AS "coinsDeducted",status,redeem_code AS "redeemCode",created_at AS "createdAt"`,[req.userId,ur.rows[0].name,ur.rows[0].email,amount,coins]);
+    const rr=await client.query(
+      `INSERT INTO app_redeem_requests(user_id,name,email,amount_inr,coins_deducted)
+       VALUES($1,$2,$3,$4,$5)
+       RETURNING id,amount_inr AS amount,coins_deducted AS "coinsDeducted",
+                 status,redeem_code AS "redeemCode",created_at AS "createdAt"`,
+      [req.userId,name,email,amount,coins]
+    );
     const bal=await client.query('SELECT coins,gems FROM app_users WHERE user_id=$1',[req.userId]);
     await client.query('COMMIT');
     res.json({success:true,request:rr.rows[0],balance:bal.rows[0]});
-  } catch(e){await client.query('ROLLBACK');console.error('redeem create',e);res.status(500).json({success:false,message:'Could not submit redeem request.'});}
-  finally{client.release();}
+  } catch(e){
+    await client.query('ROLLBACK');
+    console.error('redeem create',e);
+    res.status(500).json({success:false,message:'Could not submit redeem request.'});
+  } finally {
+    client.release();
+  }
 });
 
 app.get('/api/notifications', async (_req,res)=>{try{const r=await pool.query('SELECT id,title,message,created_at AS "createdAt" FROM app_notifications ORDER BY created_at DESC LIMIT 50');res.json({success:true,notifications:r.rows});}catch(e){res.status(500).json({success:false,message:'Could not load notifications.'});}});
