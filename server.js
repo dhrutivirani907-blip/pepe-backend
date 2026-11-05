@@ -25,7 +25,7 @@ app.use(express.json({ limit: '1mb' }));
 
 const COIN_RATES = { 10: 1500, 20: 3000, 50: 7500, 100: 15000 };
 const REFERRAL_REWARD = 100;
-const WELCOME_BONUS = 0;
+const WELCOME_BONUS = 10000;
 const SUPER_OFFER_GEM_COST = 25;
 
 async function initDb() {
@@ -72,20 +72,6 @@ async function initDb() {
       message TEXT NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
-    CREATE TABLE IF NOT EXISTS app_game_sessions (
-      id UUID PRIMARY KEY,
-      user_id VARCHAR(180) NOT NULL REFERENCES app_users(user_id),
-      started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      completed_at TIMESTAMPTZ,
-      claimed BOOLEAN NOT NULL DEFAULT FALSE
-    );
-    CREATE TABLE IF NOT EXISTS app_game_ball_visits (
-      session_id UUID NOT NULL REFERENCES app_game_sessions(id) ON DELETE CASCADE,
-      ball_index INTEGER NOT NULL CHECK (ball_index BETWEEN 0 AND 3),
-      opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      completed_at TIMESTAMPTZ,
-      PRIMARY KEY(session_id, ball_index)
-    );
     CREATE TABLE IF NOT EXISTS app_super_offers (
       id BIGSERIAL PRIMARY KEY,
       user_id VARCHAR(180) NOT NULL REFERENCES app_users(user_id),
@@ -101,6 +87,34 @@ async function initDb() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       CHECK (referrer_id <> referred_id)
     );
+    CREATE TABLE IF NOT EXISTS app_payment_requests (
+      id BIGSERIAL PRIMARY KEY,
+      user_id VARCHAR(180) NOT NULL REFERENCES app_users(user_id),
+      method VARCHAR(12) NOT NULL CHECK (method IN ('upi','crypto')),
+      name VARCHAR(120) NOT NULL,
+      account_detail VARCHAR(180) NOT NULL,
+      amount NUMERIC(12,4) NOT NULL,
+      amount_label VARCHAR(40) NOT NULL,
+      coins_deducted BIGINT NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'Pending' CHECK (status IN ('Pending','Completed','Rejected')),
+      admin_note TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS app_payment_user_idx ON app_payment_requests(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS app_payment_method_idx ON app_payment_requests(method, created_at DESC);
+    CREATE TABLE IF NOT EXISTS app_game_progress (
+      user_id VARCHAR(180) PRIMARY KEY REFERENCES app_users(user_id) ON DELETE CASCADE,
+      xp INTEGER NOT NULL DEFAULT 0 CHECK (xp BETWEEN 0 AND 100),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS app_ad_sessions (
+      id UUID PRIMARY KEY,
+      user_id VARCHAR(180) NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+      started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      completed_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS app_ad_sessions_user_idx ON app_ad_sessions(user_id, started_at DESC);
   `);
   console.log('Redeem app database ready (legacy tables preserved).');
 }
@@ -334,47 +348,101 @@ app.post('/api/redeems', userOnly, async (req,res) => {
   }
 });
 
-app.get('/api/notifications', async (_req,res)=>{try{const r=await pool.query('SELECT id,title,message,created_at AS "createdAt" FROM app_notifications ORDER BY created_at DESC LIMIT 50');res.json({success:true,notifications:r.rows});}catch(e){res.status(500).json({success:false,message:'Could not load notifications.'});}});
+// UPI and GRAM crypto withdrawal requests are stored separately from Google Play codes.
+const UPI_COIN_RATES = { 10:1500, 20:3000, 50:7500, 100:15000 };
+const GRAM_COIN_RATES = { '0.1':1700, '0.2':3400, '0.5':8500, '1':17000 };
+function validUpiId(value) { return /^[A-Za-z0-9._-]{2,100}@[A-Za-z0-9.-]{2,64}$/.test(String(value || '').trim()); }
+function validGramAddress(value) {
+  const s=String(value||'').trim();
+  return s.length>=32 && s.length<=120 && /^[A-Za-z0-9_:-]+$/.test(s);
+}
+app.get('/api/payments/:userId', userOnly, async (req,res)=>{
+  try {
+    const r=await pool.query(`SELECT id,method,name,account_detail AS "accountDetail",amount,amount_label AS "amountLabel",coins_deducted AS "coinsDeducted",status,admin_note AS "adminNote",created_at AS "createdAt",updated_at AS "updatedAt" FROM app_payment_requests WHERE user_id=$1 ORDER BY created_at DESC LIMIT 200`,[cleanId(req.params.userId)]);
+    res.json({success:true,requests:r.rows});
+  } catch(e) { console.error('user payments',e); res.status(500).json({success:false,message:'Could not load payment history.'}); }
+});
+app.post('/api/payments/:method', userOnly, async (req,res)=>{
+  const method=String(req.params.method||'').toLowerCase();
+  const name=String(req.body.name||'').trim().slice(0,120);
+  const account=String(req.body.accountDetail||'').trim().slice(0,180);
+  const rawAmount=String(req.body.amount??'');
+  let amount,coins,label;
+  if(name.length<2) return res.status(400).json({success:false,message:'Enter your full name.'});
+  if(method==='upi') {
+    amount=Number(rawAmount); coins=UPI_COIN_RATES[amount]; label='₹'+amount;
+    if(!validUpiId(account)) return res.status(400).json({success:false,message:'Enter a valid UPI ID.'});
+  } else if(method==='crypto') {
+    amount=Number(rawAmount); coins=GRAM_COIN_RATES[rawAmount]; label=rawAmount+' GRAM';
+    if(!validGramAddress(account)) return res.status(400).json({success:false,message:'Enter a valid TON network GRAM address.'});
+  } else return res.status(400).json({success:false,message:'Invalid payment method.'});
+  if(!coins) return res.status(400).json({success:false,message:'Choose a valid amount.'});
+  const client=await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const u=await client.query('SELECT coins FROM app_users WHERE user_id=$1 FOR UPDATE',[req.userId]);
+    if(!u.rowCount){await client.query('ROLLBACK');return res.status(404).json({success:false,message:'Account not found.'});}
+    if(Number(u.rows[0].coins)<coins){await client.query('ROLLBACK');return res.status(400).json({success:false,message:'Not enough coins for this withdrawal.'});}
+    await client.query('UPDATE app_users SET coins=coins-$2,updated_at=NOW() WHERE user_id=$1',[req.userId,coins]);
+    const q=await client.query(`INSERT INTO app_payment_requests(user_id,method,name,account_detail,amount,amount_label,coins_deducted) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id,method,name,account_detail AS "accountDetail",amount,amount_label AS "amountLabel",coins_deducted AS "coinsDeducted",status,created_at AS "createdAt"`,[req.userId,method,name,account,amount,label,coins]);
+    const b=await client.query('SELECT coins,gems FROM app_users WHERE user_id=$1',[req.userId]);
+    await client.query('COMMIT');
+    res.json({success:true,request:q.rows[0],balance:b.rows[0]});
+  } catch(e) { await client.query('ROLLBACK'); console.error('payment request',e); res.status(500).json({success:false,message:'Could not submit withdrawal request.'}); }
+  finally { client.release(); }
+});
 
-app.post('/api/game/start', userOnly, async (req,res)=>{
-  try{const u=await pool.query('SELECT user_id FROM app_users WHERE user_id=$1',[req.userId]);if(!u.rowCount)return res.status(404).json({success:false,message:'Sign in first.'});const id=crypto.randomUUID();await pool.query('INSERT INTO app_game_sessions(id,user_id) VALUES($1,$2)',[id,req.userId]);res.json({success:true,sessionId:id});}
-  catch(e){res.status(500).json({success:false,message:'Could not start game.'});}
+// Server-verified ad visits: one successful visit adds 25 XP; 100 XP can be exchanged for 1 Gem.
+app.get('/api/game/progress', userOnly, async (req,res)=>{
+  try {
+    await pool.query('INSERT INTO app_game_progress(user_id) VALUES($1) ON CONFLICT(user_id) DO NOTHING',[req.userId]);
+    const q=await pool.query('SELECT xp FROM app_game_progress WHERE user_id=$1',[req.userId]);
+    const u=await pool.query('SELECT coins,gems FROM app_users WHERE user_id=$1',[req.userId]);
+    res.json({success:true,xp:q.rows[0].xp,balance:u.rows[0]});
+  } catch(e) { console.error('game progress',e); res.status(500).json({success:false,message:'Could not load XP progress.'}); }
 });
-app.post('/api/game/ball/start', userOnly, async (req,res)=>{
-  const sessionId=String(req.body.sessionId||''); const ball=Number(req.body.ballIndex);
-  if(!Number.isInteger(ball)||ball<0||ball>3)return res.status(400).json({success:false,message:'Invalid ball.'});
-  try{
-    const s=await pool.query('SELECT id,claimed FROM app_game_sessions WHERE id=$1 AND user_id=$2',[sessionId,req.userId]);
-    if(!s.rowCount||s.rows[0].claimed)return res.status(400).json({success:false,message:'Game session is not active.'});
-    const old=await pool.query('SELECT completed_at FROM app_game_ball_visits WHERE session_id=$1 AND ball_index=$2',[sessionId,ball]);
-    if(old.rowCount&&old.rows[0].completed_at)return res.json({success:true,completed:true});
-    // A retry after an early return starts a fresh server-side 8-second window.
-    await pool.query(`INSERT INTO app_game_ball_visits(session_id,ball_index,opened_at,completed_at) VALUES($1,$2,NOW(),NULL)
-      ON CONFLICT(session_id,ball_index) DO UPDATE SET opened_at=NOW(),completed_at=NULL`,[sessionId,ball]);
-    res.json({success:true,completed:false});
-  }catch(e){console.error('ball start',e);res.status(500).json({success:false,message:'Could not start ball visit.'});}
+app.post('/api/game/ad/start', userOnly, async (req,res)=>{
+  try {
+    await pool.query('INSERT INTO app_game_progress(user_id) VALUES($1) ON CONFLICT(user_id) DO NOTHING',[req.userId]);
+    const p=await pool.query('SELECT xp FROM app_game_progress WHERE user_id=$1',[req.userId]);
+    if(Number(p.rows[0].xp)>=100) return res.status(400).json({success:false,message:'Claim your Gem before watching more ads.'});
+    const id=crypto.randomUUID();
+    await pool.query('INSERT INTO app_ad_sessions(id,user_id) VALUES($1,$2)',[id,req.userId]);
+    res.json({success:true,sessionId:id});
+  } catch(e) { console.error('ad start',e); res.status(500).json({success:false,message:'Could not start ad visit.'}); }
 });
-app.post('/api/game/ball/complete', userOnly, async (req,res)=>{
-  const sessionId=String(req.body.sessionId||''); const ball=Number(req.body.ballIndex);
-  if(!Number.isInteger(ball)||ball<0||ball>3)return res.status(400).json({success:false,message:'Invalid ball.'});
-  try{
-    const s=await pool.query('SELECT id FROM app_game_sessions WHERE id=$1 AND user_id=$2 AND claimed=FALSE',[sessionId,req.userId]);
-    if(!s.rowCount)return res.status(400).json({success:false,message:'Game session is not active.'});
-    const v=await pool.query(`UPDATE app_game_ball_visits SET completed_at=NOW() WHERE session_id=$1 AND ball_index=$2 AND completed_at IS NULL AND opened_at<=NOW()-INTERVAL '8 seconds' RETURNING ball_index`,[sessionId,ball]);
-    if(!v.rowCount){
-      const exists=await pool.query('SELECT completed_at FROM app_game_ball_visits WHERE session_id=$1 AND ball_index=$2',[sessionId,ball]);
-      if(exists.rowCount&&exists.rows[0].completed_at)return res.json({success:true,completed:true});
-      return res.status(400).json({success:false,message:'You did not stay for at least 8 seconds. This ball is not complete.'});
-    }
-    res.json({success:true,completed:true});
-  }catch(e){console.error('ball complete',e);res.status(500).json({success:false,message:'Could not verify ball visit.'});}
-});
-
-app.post('/api/game/claim', userOnly, async (req,res)=>{
+app.post('/api/game/ad/complete', userOnly, async (req,res)=>{
   const id=String(req.body.sessionId||''); const client=await pool.connect();
-  try{await client.query('BEGIN');const s=await client.query('SELECT id,claimed FROM app_game_sessions WHERE id=$1 AND user_id=$2 FOR UPDATE',[id,req.userId]);if(!s.rowCount){await client.query('ROLLBACK');return res.status(400).json({success:false,message:'Game session not found.'});}if(s.rows[0].claimed){await client.query('ROLLBACK');return res.status(409).json({success:false,message:'This game reward was already claimed.'});}const count=await client.query('SELECT COUNT(*)::int AS n FROM app_game_ball_visits WHERE session_id=$1 AND completed_at IS NOT NULL',[id]);if(count.rows[0].n!==4){await client.query('ROLLBACK');return res.status(400).json({success:false,message:'Complete all four verified 8-second visits first.'});}await client.query('UPDATE app_game_sessions SET claimed=TRUE,completed_at=NOW() WHERE id=$1',[id]);await client.query('UPDATE app_users SET gems=gems+1,updated_at=NOW() WHERE user_id=$1',[req.userId]);const u=await client.query('SELECT coins,gems FROM app_users WHERE user_id=$1',[req.userId]);await client.query('COMMIT');res.json({success:true,gemsAdded:1,balance:u.rows[0]});}
-  catch(e){await client.query('ROLLBACK');res.status(500).json({success:false,message:'Could not claim game reward.'});}finally{client.release();}
+  try {
+    await client.query('BEGIN');
+    const s=await client.query('SELECT id,completed_at,started_at FROM app_ad_sessions WHERE id=$1 AND user_id=$2 FOR UPDATE',[id,req.userId]);
+    if(!s.rowCount){await client.query('ROLLBACK');return res.status(404).json({success:false,message:'Ad visit session not found. Please try again.'});}
+    if(s.rows[0].completed_at){await client.query('ROLLBACK');return res.status(409).json({success:false,message:'This ad visit was already counted.'});}
+    if(new Date(s.rows[0].started_at).getTime()>Date.now()-8000){await client.query('ROLLBACK');return res.status(400).json({success:false,message:'You must stay for at least 8 seconds.'});}
+    await client.query('UPDATE app_ad_sessions SET completed_at=NOW() WHERE id=$1',[id]);
+    await client.query('INSERT INTO app_game_progress(user_id,xp) VALUES($1,25) ON CONFLICT(user_id) DO UPDATE SET xp=LEAST(100,app_game_progress.xp+25),updated_at=NOW()',[req.userId]);
+    const p=await client.query('SELECT xp FROM app_game_progress WHERE user_id=$1',[req.userId]);
+    await client.query('COMMIT');
+    res.json({success:true,xp:p.rows[0].xp,xpAdded:25});
+  } catch(e) { await client.query('ROLLBACK'); console.error('ad complete',e); res.status(500).json({success:false,message:'Could not verify this ad visit.'}); }
+  finally { client.release(); }
 });
+app.post('/api/game/claim', userOnly, async (req,res)=>{
+  const client=await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const p=await client.query('SELECT xp FROM app_game_progress WHERE user_id=$1 FOR UPDATE',[req.userId]);
+    if(!p.rowCount||Number(p.rows[0].xp)<100){await client.query('ROLLBACK');return res.status(400).json({success:false,message:'Complete 100 XP before claiming 1 Gem.'});}
+    await client.query('UPDATE app_game_progress SET xp=0,updated_at=NOW() WHERE user_id=$1',[req.userId]);
+    await client.query('UPDATE app_users SET gems=gems+1,updated_at=NOW() WHERE user_id=$1',[req.userId]);
+    const u=await client.query('SELECT coins,gems FROM app_users WHERE user_id=$1',[req.userId]);
+    await client.query('COMMIT');
+    res.json({success:true,gemsAdded:1,xp:0,balance:u.rows[0]});
+  } catch(e) { await client.query('ROLLBACK'); console.error('gem claim',e); res.status(500).json({success:false,message:'Could not claim your Gem.'}); }
+  finally { client.release(); }
+});
+
+app.get('/api/notifications', async (_req,res)=>{try{const r=await pool.query('SELECT id,title,message,created_at AS "createdAt" FROM app_notifications ORDER BY created_at DESC LIMIT 50');res.json({success:true,notifications:r.rows});}catch(e){res.status(500).json({success:false,message:'Could not load notifications.'});}});
 
 app.post('/api/super-offer/claim', userOnly, async(req,res)=>{
   const client=await pool.connect();
@@ -389,6 +457,31 @@ app.put('/api/admin/redeems/:id', adminOnly, async(req,res)=>{
   const status=String(req.body.status||''); const code=String(req.body.redeemCode||'').trim().slice(0,100); const note=String(req.body.note||'').slice(0,1000);
   if(!['Pending','Completed','Rejected'].includes(status))return res.status(400).json({success:false,message:'Invalid status.'});if(status==='Completed'&&!code)return res.status(400).json({success:false,message:'Enter the Google Play redeem code before completing.'});
   const client=await pool.connect();try{await client.query('BEGIN');const q=await client.query('SELECT * FROM app_redeem_requests WHERE id=$1 FOR UPDATE',[req.params.id]);if(!q.rowCount){await client.query('ROLLBACK');return res.status(404).json({success:false,message:'Request not found.'});}const old=q.rows[0];if(old.status==='Rejected'&&status!=='Rejected'){await client.query('ROLLBACK');return res.status(409).json({success:false,message:'Rejected requests cannot be reopened.'});}if(status==='Rejected'&&old.status!=='Rejected'){await client.query('UPDATE app_users SET coins=coins+$2,updated_at=NOW() WHERE user_id=$1',[old.user_id,old.coins_deducted]);}await client.query(`UPDATE app_redeem_requests SET status=$2,redeem_code=$3,admin_note=$4,updated_at=NOW() WHERE id=$1`,[req.params.id,status,status==='Completed'?code:null,note]);await client.query('COMMIT');res.json({success:true,message:'Request updated.'});}catch(e){await client.query('ROLLBACK');res.status(500).json({success:false,message:'Could not update request.'});}finally{client.release();}
+});
+app.get('/api/admin/payments/:method', adminOnly, async(req,res)=>{
+  const method=String(req.params.method||'').toLowerCase();
+  if(!['upi','crypto'].includes(method)) return res.status(400).json({success:false,message:'Invalid payment method.'});
+  try {
+    const q=await pool.query(`SELECT id,user_id AS "userId",method,name,account_detail AS "accountDetail",amount,amount_label AS "amountLabel",coins_deducted AS "coinsDeducted",status,admin_note AS "adminNote",created_at AS "createdAt" FROM app_payment_requests WHERE method=$1 ORDER BY created_at DESC LIMIT 500`,[method]);
+    res.json({success:true,requests:q.rows});
+  } catch(e) { console.error('admin payments',e); res.status(500).json({success:false,message:'Could not load payment requests.'}); }
+});
+app.put('/api/admin/payments/:id', adminOnly, async(req,res)=>{
+  const status=String(req.body.status||''); const note=String(req.body.note||'').trim().slice(0,1000);
+  if(!['Pending','Completed','Rejected'].includes(status)) return res.status(400).json({success:false,message:'Invalid status.'});
+  const client=await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const q=await client.query('SELECT * FROM app_payment_requests WHERE id=$1 FOR UPDATE',[req.params.id]);
+    if(!q.rowCount){await client.query('ROLLBACK');return res.status(404).json({success:false,message:'Payment request not found.'});}
+    const old=q.rows[0];
+    if(old.status==='Rejected'&&status!=='Rejected'){await client.query('ROLLBACK');return res.status(409).json({success:false,message:'Rejected requests cannot be reopened.'});}
+    if(status==='Rejected'&&old.status!=='Rejected') await client.query('UPDATE app_users SET coins=coins+$2,updated_at=NOW() WHERE user_id=$1',[old.user_id,old.coins_deducted]);
+    await client.query('UPDATE app_payment_requests SET status=$2,admin_note=$3,updated_at=NOW() WHERE id=$1',[req.params.id,status,note]);
+    await client.query('COMMIT');
+    res.json({success:true,message:'Payment request updated.'});
+  } catch(e) { await client.query('ROLLBACK'); console.error('admin payment update',e); res.status(500).json({success:false,message:'Could not update payment request.'}); }
+  finally { client.release(); }
 });
 app.post('/api/admin/notifications', adminOnly, async(req,res)=>{const title=String(req.body.title||'').trim().slice(0,160),message=String(req.body.message||'').trim().slice(0,3000);if(!title||!message)return res.status(400).json({success:false,message:'Enter a title and message.'});try{const r=await pool.query('INSERT INTO app_notifications(title,message) VALUES($1,$2) RETURNING id,title,message,created_at AS "createdAt"',[title,message]);res.json({success:true,notification:r.rows[0]});}catch(e){res.status(500).json({success:false,message:'Could not send notification.'});}});
 app.get('/api/admin/stats', adminOnly, async(_req,res)=>{try{const r=await pool.query(`SELECT (SELECT COUNT(*) FROM app_users)::int AS users,(SELECT COUNT(*) FROM app_redeem_requests)::int AS requests,(SELECT COUNT(*) FROM app_redeem_requests WHERE status='Pending')::int AS pending,(SELECT COALESCE(SUM(coins),0) FROM app_users)::bigint AS coins,(SELECT COALESCE(SUM(gems),0) FROM app_users)::bigint AS gems`);res.json({success:true,stats:r.rows[0]});}catch(e){res.status(500).json({success:false,message:'Could not load stats.'});}});
