@@ -24,8 +24,9 @@ app.use(cors({
 app.use(express.json({ limit: '1mb' }));
 
 const COIN_RATES = { 10: 1500, 20: 3000, 50: 7500, 100: 15000 };
-const REFERRAL_REWARD = 100;
-const WELCOME_BONUS = 10000;
+const REFERRAL_LINK_REWARD = 100;
+const REFERRAL_CODE_REWARD = 300;
+const WELCOME_BONUS = 100;
 const SUPER_OFFER_GEM_COST = 25;
 
 async function initDb() {
@@ -191,6 +192,7 @@ app.post('/api/auth/signup', async (req, res) => {
   const email = normalizeEmail(req.body.email);
   const password = String(req.body.password || '');
   const referralCode = String(req.body.referralCode || '').trim().toUpperCase().slice(0, 40);
+  const referralSource = String(req.body.referralSource || (referralCode ? 'link' : 'none')).toLowerCase();
   if (name.length < 2 || !validEmail(email) || password.length < 8 || password.length > 200) {
     return res.status(400).json({ success: false, message: 'Enter a valid name, email and password (8–200 characters).' });
   }
@@ -206,18 +208,36 @@ app.post('/api/auth/signup', async (req, res) => {
     const ownCode = 'R' + crypto.randomBytes(5).toString('hex').toUpperCase();
     const passwordHash = await hashPassword(password);
     let referrer = null;
+    let signupBonus = WELCOME_BONUS;
+    let referrerReward = 0;
     if (referralCode) {
       const found = await client.query('SELECT user_id FROM app_users WHERE referral_code=$1', [referralCode]);
-      if (found.rowCount) referrer = found.rows[0].user_id;
+      if (!found.rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: 'Invalid referral code. Please check the code and try again.' });
+      }
+      referrer = found.rows[0].user_id;
+      if (referrer === userId) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: 'You cannot use your own referral code.' });
+      }
+      if (referralSource === 'code') {
+        signupBonus = REFERRAL_CODE_REWARD;
+        referrerReward = REFERRAL_CODE_REWARD;
+      } else {
+        // A signup opened through the personal invite link earns the standard link reward.
+        signupBonus = WELCOME_BONUS;
+        referrerReward = REFERRAL_LINK_REWARD;
+      }
     }
     await client.query(
       `INSERT INTO app_users(user_id,name,email,password_hash,coins,gems,referral_code,referred_by)
        VALUES($1,$2,$3,$4,$5,0,$6,$7)`,
-      [userId, name, email, passwordHash, WELCOME_BONUS, ownCode, referrer]
+      [userId, name, email, passwordHash, signupBonus, ownCode, referrer]
     );
-    if (referrer && referrer !== userId) {
-      await client.query('UPDATE app_users SET coins=coins+$2,updated_at=NOW() WHERE user_id=$1', [referrer, REFERRAL_REWARD]);
-      await client.query('INSERT INTO app_referrals(referrer_id,referred_id,reward) VALUES($1,$2,$3) ON CONFLICT(referred_id) DO NOTHING', [referrer, userId, REFERRAL_REWARD]);
+    if (referrer && referrerReward > 0) {
+      await client.query('UPDATE app_users SET coins=coins+$2,updated_at=NOW() WHERE user_id=$1', [referrer, referrerReward]);
+      await client.query('INSERT INTO app_referrals(referrer_id,referred_id,reward) VALUES($1,$2,$3) ON CONFLICT(referred_id) DO NOTHING', [referrer, userId, referrerReward]);
     }
     await client.query('COMMIT');
     await createSession(userId, res);
