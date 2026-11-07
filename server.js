@@ -116,6 +116,27 @@ async function initDb() {
       completed_at TIMESTAMPTZ
     );
     CREATE INDEX IF NOT EXISTS app_ad_sessions_user_idx ON app_ad_sessions(user_id, started_at DESC);
+    CREATE TABLE IF NOT EXISTS app_social_orders (
+      id BIGSERIAL PRIMARY KEY,
+      user_id VARCHAR(180) NOT NULL REFERENCES app_users(user_id),
+      platform VARCHAR(16) NOT NULL CHECK (platform IN ('instagram','telegram')),
+      quantity VARCHAR(40) NOT NULL,
+      link TEXT NOT NULL,
+      coins_deducted BIGINT NOT NULL CHECK (coins_deducted > 0),
+      status VARCHAR(20) NOT NULL DEFAULT 'Pending' CHECK (status IN ('Pending','Completed','Rejected')),
+      admin_note TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS app_social_orders_user_idx ON app_social_orders(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS app_social_orders_platform_idx ON app_social_orders(platform, created_at DESC);
+    CREATE TABLE IF NOT EXISTS app_coin_ad_sessions (
+      id UUID PRIMARY KEY,
+      user_id VARCHAR(180) NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+      started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      completed_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS app_coin_ad_sessions_user_idx ON app_coin_ad_sessions(user_id, started_at DESC);
   `);
   console.log('Redeem app database ready (legacy tables preserved).');
 }
@@ -471,6 +492,116 @@ app.post('/api/super-offer/claim', userOnly, async(req,res)=>{
 });
 
 // Admin API
+
+// Social service orders: new additive tables; existing redeem/payment data is untouched.
+const SOCIAL_PRICES = {
+  instagram: { '1K views': 50, '5K views': 250, '50K views': 2500, '100K views': 5000 },
+  telegram: { '100 members': 500, '500 members': 2500, '1K members': 5000 }
+};
+app.post('/api/orders', userOnly, async (req,res) => {
+  const platform=String(req.body.platform||'').toLowerCase();
+  const quantity=String(req.body.quantity||'');
+  const link=String(req.body.link||'').trim().slice(0,2000);
+  const expected=SOCIAL_PRICES[platform]?.[quantity];
+  let parsed;
+  try { parsed=new URL(link); } catch { parsed=null; }
+  if(!expected || !parsed || !['http:','https:'].includes(parsed.protocol))
+    return res.status(400).json({success:false,message:'Choose a valid package and enter a valid http or https link.'});
+  const client=await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const u=await client.query('SELECT coins FROM app_users WHERE user_id=$1 FOR UPDATE',[req.userId]);
+    if(!u.rowCount){await client.query('ROLLBACK');return res.status(404).json({success:false,message:'Account not found.'});}
+    if(Number(u.rows[0].coins)<expected){await client.query('ROLLBACK');return res.status(400).json({success:false,message:'Not enough Gold Coins for this order.'});}
+    await client.query('UPDATE app_users SET coins=coins-$2,updated_at=NOW() WHERE user_id=$1',[req.userId,expected]);
+    const q=await client.query(
+      `INSERT INTO app_social_orders(user_id,platform,quantity,link,coins_deducted)
+       VALUES($1,$2,$3,$4,$5)
+       RETURNING id,platform,quantity,link,coins_deducted AS "coinsDeducted",status,created_at AS "createdAt"`,
+      [req.userId,platform,quantity,link,expected]
+    );
+    const user=await client.query('SELECT user_id AS "userId",name,email,coins,gems,referral_code AS "referralCode" FROM app_users WHERE user_id=$1',[req.userId]);
+    await client.query('COMMIT');
+    res.json({success:true,order:q.rows[0],user:user.rows[0]});
+  } catch(e) {
+    await client.query('ROLLBACK'); console.error('social order create',e);
+    res.status(500).json({success:false,message:'Could not submit your order.'});
+  } finally { client.release(); }
+});
+app.get('/api/orders', userOnly, async(req,res)=>{
+  try {
+    const q=await pool.query(
+      `SELECT id,platform,quantity,link,coins_deducted AS "coinsDeducted",status,
+              admin_note AS "adminNote",created_at AS "createdAt",updated_at AS "updatedAt"
+       FROM app_social_orders WHERE user_id=$1 ORDER BY created_at DESC LIMIT 200`,
+      [req.userId]
+    );
+    res.json({success:true,orders:q.rows});
+  } catch(e) { console.error('social order history',e); res.status(500).json({success:false,message:'Could not load order history.'}); }
+});
+app.get('/api/admin/orders', adminOnly, async(req,res)=>{
+  const platform=String(req.query.platform||'').toLowerCase();
+  if(!['instagram','telegram'].includes(platform))return res.status(400).json({success:false,message:'Choose Instagram or Telegram.'});
+  try {
+    const q=await pool.query(
+      `SELECT o.id,o.user_id AS "userId",u.name,u.email,o.platform,o.quantity,o.link,
+              o.coins_deducted AS "coinsDeducted",o.status,o.admin_note AS "adminNote",
+              o.created_at AS "createdAt",o.updated_at AS "updatedAt"
+       FROM app_social_orders o JOIN app_users u ON u.user_id=o.user_id
+       WHERE o.platform=$1 ORDER BY o.created_at DESC LIMIT 1000`,
+      [platform]
+    );
+    res.json({success:true,orders:q.rows});
+  } catch(e) { console.error('admin social orders',e); res.status(500).json({success:false,message:'Could not load social orders.'}); }
+});
+app.put('/api/admin/orders/:id', adminOnly, async(req,res)=>{
+  const status=String(req.body.status||'');
+  const note=String(req.body.note||'').trim().slice(0,1000);
+  if(!['Pending','Completed','Rejected'].includes(status))return res.status(400).json({success:false,message:'Invalid status.'});
+  const client=await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const q=await client.query('SELECT * FROM app_social_orders WHERE id=$1 FOR UPDATE',[req.params.id]);
+    if(!q.rowCount){await client.query('ROLLBACK');return res.status(404).json({success:false,message:'Order not found.'});}
+    const old=q.rows[0];
+    if(old.status==='Rejected' && status!=='Rejected'){
+      await client.query('ROLLBACK');return res.status(409).json({success:false,message:'Rejected orders cannot be reopened.'});
+    }
+    if(status==='Rejected' && old.status!=='Rejected'){
+      await client.query('UPDATE app_users SET coins=coins+$2,updated_at=NOW() WHERE user_id=$1',[old.user_id,old.coins_deducted]);
+    }
+    await client.query('UPDATE app_social_orders SET status=$2,admin_note=$3,updated_at=NOW() WHERE id=$1',[req.params.id,status,note]);
+    await client.query('COMMIT');
+    res.json({success:true,message:'Order updated successfully.'});
+  } catch(e) { await client.query('ROLLBACK'); console.error('admin social order update',e); res.status(500).json({success:false,message:'Could not update order.'}); }
+  finally { client.release(); }
+});
+
+// Dedicated one-coin ad flow; server verifies the full eight-second visit.
+app.post('/api/coins/ad/start', userOnly, async(req,res)=>{
+  try {
+    const id=crypto.randomUUID();
+    await pool.query('INSERT INTO app_coin_ad_sessions(id,user_id) VALUES($1,$2)',[id,req.userId]);
+    res.json({success:true,sessionId:id});
+  } catch(e) { console.error('coin ad start',e); res.status(500).json({success:false,message:'Could not start ad visit.'}); }
+});
+app.post('/api/coins/ad/complete', userOnly, async(req,res)=>{
+  const id=String(req.body.sessionId||'');
+  const client=await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const s=await client.query('SELECT id,started_at,completed_at FROM app_coin_ad_sessions WHERE id=$1 AND user_id=$2 FOR UPDATE',[id,req.userId]);
+    if(!s.rowCount){await client.query('ROLLBACK');return res.status(404).json({success:false,message:'Ad session not found.'});}
+    if(s.rows[0].completed_at){await client.query('ROLLBACK');return res.status(409).json({success:false,message:'This ad visit was already rewarded.'});}
+    if(new Date(s.rows[0].started_at).getTime()>Date.now()-8000){await client.query('ROLLBACK');return res.status(400).json({success:false,message:'You must watch the ad for at least 8 seconds.'});}
+    await client.query('UPDATE app_coin_ad_sessions SET completed_at=NOW() WHERE id=$1',[id]);
+    const u=await client.query('UPDATE app_users SET coins=coins+1,updated_at=NOW() WHERE user_id=$1 RETURNING coins',[req.userId]);
+    await client.query('COMMIT');
+    res.json({success:true,coins:u.rows[0].coins,coinsAdded:1});
+  } catch(e) { await client.query('ROLLBACK'); console.error('coin ad complete',e); res.status(500).json({success:false,message:'Could not verify this ad visit.'}); }
+  finally { client.release(); }
+});
+
 app.post('/api/admin/login', (req,res)=>{if(!ADMIN_PASSWORD || String(req.body.password||'')!==ADMIN_PASSWORD)return res.status(401).json({success:false,message:'Incorrect admin password.'});res.json({success:true});});
 app.get('/api/admin/redeems', adminOnly, async(_req,res)=>{try{const r=await pool.query(`SELECT id,user_id AS "userId",name,email,amount_inr AS amount,coins_deducted AS "coinsDeducted",status,redeem_code AS "redeemCode",created_at AS "createdAt" FROM app_redeem_requests ORDER BY created_at DESC LIMIT 500`);res.json({success:true,requests:r.rows});}catch(e){res.status(500).json({success:false,message:'Could not load requests.'});}});
 app.put('/api/admin/redeems/:id', adminOnly, async(req,res)=>{
