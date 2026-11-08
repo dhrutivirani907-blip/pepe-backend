@@ -104,6 +104,21 @@ async function initDb() {
     );
     CREATE INDEX IF NOT EXISTS app_payment_user_idx ON app_payment_requests(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS app_payment_method_idx ON app_payment_requests(method, created_at DESC);
+    CREATE TABLE IF NOT EXISTS app_coin_purchases (
+      id BIGSERIAL PRIMARY KEY,
+      user_id VARCHAR(180) NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+      method VARCHAR(12) NOT NULL CHECK (method IN ('upi','crypto')),
+      coin_package INTEGER NOT NULL CHECK (coin_package IN (500,2000,5000,10000)),
+      amount_paid NUMERIC(12,4) NOT NULL,
+      amount_label VARCHAR(40) NOT NULL,
+      payment_reference VARCHAR(220) NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'Pending' CHECK (status IN ('Pending','Completed','Rejected')),
+      admin_note TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS app_coin_purchase_user_idx ON app_coin_purchases(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS app_coin_purchase_method_idx ON app_coin_purchases(method, created_at DESC);
     CREATE TABLE IF NOT EXISTS app_game_progress (
       user_id VARCHAR(180) PRIMARY KEY REFERENCES app_users(user_id) ON DELETE CASCADE,
       xp INTEGER NOT NULL DEFAULT 0 CHECK (xp BETWEEN 0 AND 100),
@@ -539,6 +554,59 @@ app.get('/api/orders', userOnly, async(req,res)=>{
     res.json({success:true,orders:q.rows});
   } catch(e) { console.error('social order history',e); res.status(500).json({success:false,message:'Could not load order history.'}); }
 });
+// Gold Coin purchases are separate from withdrawals. Submitting a purchase never credits coins.
+const GOLD_BUY_PACKAGES = {
+  500: { inr: 20, usd: 0.20, gram: 0.15 },
+  2000: { inr: 70, usd: 0.70, gram: 0.6 },
+  5000: { inr: 150, usd: 1.50, gram: 1.4 },
+  10000: { inr: 300, usd: 3.00, gram: 2.7 }
+};
+app.get('/api/coin-purchases', userOnly, async (req,res)=>{
+  try {
+    const q=await pool.query(`SELECT id,method,coin_package AS "coinPackage",amount_paid AS "amountPaid",amount_label AS "amountLabel",payment_reference AS "paymentReference",status,admin_note AS "adminNote",created_at AS "createdAt" FROM app_coin_purchases WHERE user_id=$1 ORDER BY created_at DESC LIMIT 200`,[req.userId]);
+    res.json({success:true,requests:q.rows});
+  } catch(e) { console.error('coin purchase history',e); res.status(500).json({success:false,message:'Could not load purchase history.'}); }
+});
+app.post('/api/coin-purchases', userOnly, async (req,res)=>{
+  const method=String(req.body.method||'').toLowerCase();
+  const coins=Number(req.body.coinPackage);
+  const pkg=GOLD_BUY_PACKAGES[coins];
+  const reference=String(req.body.paymentReference||'').trim().slice(0,220);
+  if(!pkg || !['upi','crypto'].includes(method) || reference.length<4) return res.status(400).json({success:false,message:'Please enter valid purchase and payment details.'});
+  const amount=method==='upi'?pkg.inr:pkg.gram;
+  const label=method==='upi'?`INR ${pkg.inr}`:`${pkg.gram} GRAM`;
+  try {
+    const q=await pool.query(`INSERT INTO app_coin_purchases(user_id,method,coin_package,amount_paid,amount_label,payment_reference) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,method,coin_package AS "coinPackage",amount_paid AS "amountPaid",amount_label AS "amountLabel",payment_reference AS "paymentReference",status,created_at AS "createdAt"`,[req.userId,method,coins,amount,label,reference]);
+    res.json({success:true,request:q.rows[0],message:'Your request is submitted. Order complete within 24 to 48 hours.'});
+  } catch(e) { console.error('coin purchase submit',e); res.status(500).json({success:false,message:'Could not submit purchase request.'}); }
+});
+app.get('/api/admin/coin-purchases/:method', adminOnly, async(req,res)=>{
+  const method=String(req.params.method||'').toLowerCase();
+  if(!['upi','crypto'].includes(method)) return res.status(400).json({success:false,message:'Invalid payment method.'});
+  try {
+    const q=await pool.query(`SELECT p.id,p.user_id AS "userId",u.name,u.email,p.method,p.coin_package AS "coinPackage",p.amount_paid AS "amountPaid",p.amount_label AS "amountLabel",p.payment_reference AS "paymentReference",p.status,p.admin_note AS "adminNote",p.created_at AS "createdAt" FROM app_coin_purchases p JOIN app_users u ON u.user_id=p.user_id WHERE p.method=$1 ORDER BY p.created_at DESC LIMIT 500`,[method]);
+    res.json({success:true,requests:q.rows});
+  } catch(e) { console.error('admin coin purchases',e); res.status(500).json({success:false,message:'Could not load purchase requests.'}); }
+});
+app.put('/api/admin/coin-purchases/:id', adminOnly, async(req,res)=>{
+  const status=String(req.body.status||''); const note=String(req.body.note||'').trim().slice(0,1000);
+  if(!['Pending','Completed','Rejected'].includes(status)) return res.status(400).json({success:false,message:'Invalid status.'});
+  try {
+    const q=await pool.query('UPDATE app_coin_purchases SET status=$2,admin_note=$3,updated_at=NOW() WHERE id=$1 RETURNING id',[req.params.id,status,note]);
+    if(!q.rowCount) return res.status(404).json({success:false,message:'Purchase request not found.'});
+    res.json({success:true,message:'Purchase status updated. Coins were not credited automatically.'});
+  } catch(e) { console.error('admin coin purchase update',e); res.status(500).json({success:false,message:'Could not update purchase request.'}); }
+});
+app.post('/api/admin/add-coins', adminOnly, async(req,res)=>{
+  const email=normalizeEmail(req.body.email); const coins=Number(req.body.coins);
+  if(!validEmail(email)||!Number.isSafeInteger(coins)||coins<1||coins>100000000) return res.status(400).json({success:false,message:'Enter a valid user email and coin amount.'});
+  try {
+    const q=await pool.query('UPDATE app_users SET coins=coins+$2,updated_at=NOW() WHERE LOWER(email)=LOWER($1) RETURNING user_id AS "userId",name,email,coins',[email,coins]);
+    if(!q.rowCount) return res.status(404).json({success:false,message:'No user found with this email.'});
+    res.json({success:true,user:q.rows[0],message:`${coins.toLocaleString('en-IN')} Gold Coins added successfully.`});
+  } catch(e) { console.error('admin add coins',e); res.status(500).json({success:false,message:'Could not add coins.'}); }
+});
+
 app.get('/api/admin/orders', adminOnly, async(req,res)=>{
   const platform=String(req.query.platform||'').toLowerCase();
   if(!['instagram','telegram'].includes(platform))return res.status(400).json({success:false,message:'Choose Instagram or Telegram.'});
