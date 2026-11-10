@@ -171,6 +171,17 @@ async function initDb() {
       completed_at TIMESTAMPTZ
     );
     CREATE INDEX IF NOT EXISTS app_dino_ad_user_idx ON app_dino_ad_sessions(user_id, started_at DESC);
+    CREATE TABLE IF NOT EXISTS app_dino_redeems (
+      id BIGSERIAL PRIMARY KEY,
+      user_id VARCHAR(180) NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+      wallet_address VARCHAR(160) NOT NULL,
+      points BIGINT NOT NULL CHECK (points > 0),
+      gram_amount NUMERIC(30,12) NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'Pending' CHECK (status IN ('Pending','Completed','Rejected')),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS app_dino_redeem_user_idx ON app_dino_redeems(user_id, created_at DESC);
   `);
   console.log('Redeem app database ready (legacy tables preserved).');
 }
@@ -781,6 +792,57 @@ app.post('/api/dino/ad/complete', userOnly, async (req,res)=>{
     await client.query('COMMIT');
     res.json({success:true,pointsAdded:Number(a.rows[0].points),coins:u.rows[0].coins,gems:u.rows[0].gems});
   } catch(e) { await client.query('ROLLBACK'); console.error('dino ad complete',e); res.status(500).json({success:false,message:'Could not verify your reward. Please try again.'}); }
+  finally { client.release(); }
+});
+
+
+// Dino Rush GRAM point redemptions. 15,000 points = 0.000075 GRAM.
+app.get('/api/dino/redeems', userOnly, async (req,res)=>{
+  try {
+    const q=await pool.query(`SELECT id,points,gram_amount AS "gramAmount",status,created_at AS "createdAt" FROM app_dino_redeems WHERE user_id=$1 ORDER BY created_at DESC LIMIT 200`,[req.userId]);
+    res.json({success:true,requests:q.rows});
+  } catch(e) { console.error('Dino redeem history',e); res.status(500).json({success:false,message:'Could not load redemption history.'}); }
+});
+app.post('/api/dino/redeems', userOnly, async (req,res)=>{
+  const address=String(req.body.address||'').trim();
+  const points=Number(req.body.points);
+  if(address.length<20 || address.length>160 || !Number.isSafeInteger(points) || points<1) return res.status(400).json({success:false,message:'Enter a valid TON address and point amount.'});
+  const gram=points*0.000000005;
+  if(!Number.isFinite(gram) || gram<=0) return res.status(400).json({success:false,message:'Invalid GRAM amount.'});
+  const client=await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const u=await client.query('SELECT coins FROM app_users WHERE user_id=$1 FOR UPDATE',[req.userId]);
+    if(!u.rowCount){await client.query('ROLLBACK');return res.status(404).json({success:false,message:'Account not found.'});}
+    if(Number(u.rows[0].coins)<points){await client.query('ROLLBACK');return res.status(400).json({success:false,message:'Insufficient points balance.'});}
+    await client.query('UPDATE app_users SET coins=coins-$2,updated_at=NOW() WHERE user_id=$1',[req.userId,points]);
+    const q=await client.query(`INSERT INTO app_dino_redeems(user_id,wallet_address,points,gram_amount) VALUES($1,$2,$3,$4) RETURNING id,points,gram_amount AS "gramAmount",status,created_at AS "createdAt"`,[req.userId,address,points,gram.toFixed(12)]);
+    await client.query('COMMIT');
+    res.json({success:true,request:q.rows[0],message:'Your GRAM redemption request has been submitted.'});
+  } catch(e) { await client.query('ROLLBACK'); console.error('Dino redeem submit',e); res.status(500).json({success:false,message:'Could not submit redemption request.'}); }
+  finally { client.release(); }
+});
+app.get('/api/admin/dino/redeems', adminOnly, async (_req,res)=>{
+  try {
+    const q=await pool.query(`SELECT r.id,r.wallet_address AS address,r.points,r.gram_amount AS "gramAmount",r.status,r.created_at AS "createdAt" FROM app_dino_redeems r ORDER BY r.created_at DESC LIMIT 1000`);
+    res.json({success:true,requests:q.rows});
+  } catch(e) { console.error('Admin Dino redeems',e); res.status(500).json({success:false,message:'Could not load GRAM redemption requests.'}); }
+});
+app.put('/api/admin/dino/redeems/:id', adminOnly, async (req,res)=>{
+  const status=String(req.body.status||'');
+  if(!['Pending','Completed','Rejected'].includes(status)) return res.status(400).json({success:false,message:'Invalid status.'});
+  const client=await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const q=await client.query('SELECT * FROM app_dino_redeems WHERE id=$1 FOR UPDATE',[req.params.id]);
+    if(!q.rowCount){await client.query('ROLLBACK');return res.status(404).json({success:false,message:'Redemption request not found.'});}
+    const old=q.rows[0];
+    if(old.status==='Rejected' && status!=='Rejected'){await client.query('ROLLBACK');return res.status(409).json({success:false,message:'Rejected requests cannot be reopened.'});}
+    if(status==='Rejected' && old.status!=='Rejected') await client.query('UPDATE app_users SET coins=coins+$2,updated_at=NOW() WHERE user_id=$1',[old.user_id,old.points]);
+    await client.query('UPDATE app_dino_redeems SET status=$2,updated_at=NOW() WHERE id=$1',[req.params.id,status]);
+    await client.query('COMMIT');
+    res.json({success:true,message:status==='Rejected'?'Request rejected and points refunded.':'Request status updated.'});
+  } catch(e) { await client.query('ROLLBACK'); console.error('Admin Dino redeem update',e); res.status(500).json({success:false,message:'Could not update redemption status.'}); }
   finally { client.release(); }
 });
 
