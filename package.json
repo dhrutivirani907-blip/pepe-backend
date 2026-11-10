@@ -1,10 +1,17 @@
 {
-  "name": "usdt-fan-miner",
+  "name": "dino-parkour-app",
   "version": "1.0.0",
   "private": true,
-  "description": "USDT Fan Miner app with manual BEP20 deposit and withdrawal review",
+  "description": "Dino Parkour game using the existing PostgreSQL account backend",
   "main": "server.js",
-  "scripts": { "start": "node server.js", "check": "node --check server.js" },
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js"
+  },
   "engines": { "node": ">=20" },
-  "dependencies": { "cors": "^2.8.5", "express": "^4.21.2", "pg": "^8.13.1" }
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "pg": "^8.13.1"
+  }
 }
