@@ -806,7 +806,7 @@ app.get('/api/dino/redeems', userOnly, async (req,res)=>{
 app.post('/api/dino/redeems', userOnly, async (req,res)=>{
   const address=String(req.body.address||'').trim();
   const points=Number(req.body.points);
-  if(address.length<20 || address.length>160 || !Number.isSafeInteger(points) || points<1) return res.status(400).json({success:false,message:'Enter a valid TON address and point amount.'});
+  if(address.length<20 || address.length>160 || !Number.isSafeInteger(points) || points<500000) return res.status(400).json({success:false,message:'Minimum withdrawal is 500,000 points. Enter a valid TON address and point amount.'});
   const gram=points*0.000000005;
   if(!Number.isFinite(gram) || gram<=0) return res.status(400).json({success:false,message:'Invalid GRAM amount.'});
   const client=await pool.connect();
