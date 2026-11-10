@@ -152,6 +152,25 @@ async function initDb() {
       completed_at TIMESTAMPTZ
     );
     CREATE INDEX IF NOT EXISTS app_coin_ad_sessions_user_idx ON app_coin_ad_sessions(user_id, started_at DESC);
+    CREATE TABLE IF NOT EXISTS app_dino_games (
+      id UUID PRIMARY KEY,
+      user_id VARCHAR(180) NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+      started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      finished_at TIMESTAMPTZ,
+      elapsed_seconds INTEGER,
+      points BIGINT NOT NULL DEFAULT 0 CHECK (points BETWEEN 0 AND 15000),
+      claimed_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS app_dino_games_user_idx ON app_dino_games(user_id, started_at DESC);
+    CREATE TABLE IF NOT EXISTS app_dino_ad_sessions (
+      id UUID PRIMARY KEY,
+      game_id UUID NOT NULL UNIQUE REFERENCES app_dino_games(id) ON DELETE CASCADE,
+      user_id VARCHAR(180) NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+      points BIGINT NOT NULL CHECK (points BETWEEN 0 AND 15000),
+      started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      completed_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS app_dino_ad_user_idx ON app_dino_ad_sessions(user_id, started_at DESC);
   `);
   console.log('Redeem app database ready (legacy tables preserved).');
 }
@@ -704,5 +723,65 @@ app.put('/api/admin/payments/:id', adminOnly, async(req,res)=>{
 });
 app.post('/api/admin/notifications', adminOnly, async(req,res)=>{const title=String(req.body.title||'').trim().slice(0,160),message=String(req.body.message||'').trim().slice(0,3000);if(!title||!message)return res.status(400).json({success:false,message:'Enter a title and message.'});try{const r=await pool.query('INSERT INTO app_notifications(title,message) VALUES($1,$2) RETURNING id,title,message,created_at AS "createdAt"',[title,message]);res.json({success:true,notification:r.rows[0]});}catch(e){res.status(500).json({success:false,message:'Could not send notification.'});}});
 app.get('/api/admin/stats', adminOnly, async(_req,res)=>{try{const r=await pool.query(`SELECT (SELECT COUNT(*) FROM app_users)::int AS users,(SELECT COUNT(*) FROM app_redeem_requests)::int AS requests,(SELECT COUNT(*) FROM app_redeem_requests WHERE status='Pending')::int AS pending,(SELECT COALESCE(SUM(coins),0) FROM app_users)::bigint AS coins,(SELECT COALESCE(SUM(gems),0) FROM app_users)::bigint AS gems`);res.json({success:true,stats:r.rows[0]});}catch(e){res.status(500).json({success:false,message:'Could not load stats.'});}});
+
+
+
+// Dino Parkour: additive game APIs. Existing account, balance and legacy APIs remain unchanged.
+app.post('/api/dino/game/start', userOnly, async (req,res)=>{
+  try {
+    const id=crypto.randomUUID();
+    await pool.query('INSERT INTO app_dino_games(id,user_id) VALUES($1,$2)',[id,req.userId]);
+    res.json({success:true,gameSessionId:id,startedAt:new Date().toISOString()});
+  } catch(e) { console.error('dino game start',e); res.status(500).json({success:false,message:'Could not start this game. Please try again.'}); }
+});
+app.post('/api/dino/game/finish', userOnly, async (req,res)=>{
+  const id=String(req.body.gameSessionId||'');
+  const seconds=Math.max(0,Math.min(30,Math.floor(Number(req.body.elapsedSeconds)||0)));
+  if(!/^[0-9a-f-]{36}$/i.test(id)) return res.status(400).json({success:false,message:'Invalid game session.'});
+  const client=await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const g=await client.query('SELECT id,started_at,finished_at FROM app_dino_games WHERE id=$1 AND user_id=$2 FOR UPDATE',[id,req.userId]);
+    if(!g.rowCount){await client.query('ROLLBACK');return res.status(404).json({success:false,message:'Game session not found.'});}
+    if(g.rows[0].finished_at){await client.query('ROLLBACK');return res.status(409).json({success:false,message:'This game has already finished.'});}
+    const elapsedMs=Date.now()-new Date(g.rows[0].started_at).getTime();
+    if(elapsedMs < Math.max(0,seconds*1000-1800) || elapsedMs > 10*60*1000){await client.query('ROLLBACK');return res.status(400).json({success:false,message:'Game timing could not be verified. Please play again.'});}
+    const points=seconds*500;
+    await client.query('UPDATE app_dino_games SET finished_at=NOW(),elapsed_seconds=$2,points=$3 WHERE id=$1',[id,seconds,points]);
+    await client.query('COMMIT');
+    res.json({success:true,points,elapsedSeconds:seconds});
+  } catch(e) { await client.query('ROLLBACK'); console.error('dino game finish',e); res.status(500).json({success:false,message:'Could not save this game result.'}); }
+  finally { client.release(); }
+});
+app.post('/api/dino/ad/start', userOnly, async (req,res)=>{
+  const gameId=String(req.body.gameSessionId||'');
+  try {
+    const g=await pool.query('SELECT points,finished_at FROM app_dino_games WHERE id=$1 AND user_id=$2',[gameId,req.userId]);
+    if(!g.rowCount || !g.rows[0].finished_at) return res.status(400).json({success:false,message:'Finish a game before opening the reward link.'});
+    const existing=await pool.query('SELECT id FROM app_dino_ad_sessions WHERE game_id=$1',[gameId]);
+    if(existing.rowCount) return res.status(409).json({success:false,message:'The reward link for this game has already been started.'});
+    const id=crypto.randomUUID();
+    await pool.query('INSERT INTO app_dino_ad_sessions(id,game_id,user_id,points) VALUES($1,$2,$3,$4)',[id,gameId,req.userId,g.rows[0].points]);
+    res.json({success:true,adSessionId:id,points:Number(g.rows[0].points)});
+  } catch(e) { console.error('dino ad start',e); res.status(500).json({success:false,message:'Could not start reward verification.'}); }
+});
+app.post('/api/dino/ad/complete', userOnly, async (req,res)=>{
+  const id=String(req.body.adSessionId||'');
+  const client=await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const a=await client.query('SELECT id,points,started_at,completed_at FROM app_dino_ad_sessions WHERE id=$1 AND user_id=$2 FOR UPDATE',[id,req.userId]);
+    if(!a.rowCount){await client.query('ROLLBACK');return res.status(404).json({success:false,message:'Reward visit not found. Please try again.'});}
+    if(a.rows[0].completed_at){await client.query('ROLLBACK');return res.status(409).json({success:false,message:'This game reward has already been claimed.'});}
+    const remaining=8000-(Date.now()-new Date(a.rows[0].started_at).getTime());
+    if(remaining>0){await client.query('ROLLBACK');return res.status(400).json({success:false,message:'You must stay on the opened link for at least 8 seconds.',remainingMs:remaining});}
+    await client.query('UPDATE app_dino_ad_sessions SET completed_at=NOW() WHERE id=$1',[id]);
+    await client.query('UPDATE app_dino_games SET claimed_at=NOW() WHERE id=(SELECT game_id FROM app_dino_ad_sessions WHERE id=$1)',[id]);
+    const u=await client.query('UPDATE app_users SET coins=coins+$2,updated_at=NOW() WHERE user_id=$1 RETURNING coins,gems',[req.userId,a.rows[0].points]);
+    await client.query('COMMIT');
+    res.json({success:true,pointsAdded:Number(a.rows[0].points),coins:u.rows[0].coins,gems:u.rows[0].gems});
+  } catch(e) { await client.query('ROLLBACK'); console.error('dino ad complete',e); res.status(500).json({success:false,message:'Could not verify your reward. Please try again.'}); }
+  finally { client.release(); }
+});
 
 initDb().then(()=>app.listen(PORT,()=>console.log(`Redeem & Earn app listening on ${PORT}`))).catch(e=>{console.error('Database startup failed:',e);process.exit(1);});
