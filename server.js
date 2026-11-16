@@ -853,6 +853,24 @@ app.post('/api/dino/redeems', userOnly, async (req,res)=>{
     res.status(500).json({success:false,message:'Could not submit redemption request.'});
   } finally { client.release(); }
 });
+
+// Public aggregate payout totals shown on the three redemption cards.
+// Only requests whose current status is Completed are counted as paid.
+app.get('/api/dino/redeem-stats', async (_req,res)=>{
+  try {
+    const q=await pool.query(
+      `SELECT asset,
+              COUNT(*) FILTER (WHERE status='Completed')::int AS payouts,
+              COALESCE(SUM(payout_amount) FILTER (WHERE status='Completed'),0)::text AS paid
+       FROM app_dino_redeems
+       GROUP BY asset`
+    );
+    res.json({success:true,stats:q.rows});
+  } catch(e) {
+    console.error('Dino redeem stats',e);
+    res.status(500).json({success:false,message:'Could not load payout totals.'});
+  }
+});
 app.get('/api/admin/dino/redeems', adminOnly, async (_req,res)=>{
   try {
     const q=await pool.query(
