@@ -199,20 +199,26 @@ function adminOnly(req, res, next) {
   next();
 }
 async function userOnly(req, res, next) {
-  const id = cleanId(req.body?.userId || req.params?.userId || req.query?.userId);
+  // The bearer token is the source of truth for the signed-in user.
+  // A supplied userId is optional, but if present it must match the session.
+  const requestedId = cleanId(req.body?.userId || req.params?.userId || req.query?.userId);
   const header = String(req.headers.authorization || '');
   const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
-  if (!id || !token) return res.status(401).json({ success:false, message:'Please log in to continue.' });
+  if (!token) return res.status(401).json({ success:false, message:'Please log in to continue.' });
   try {
     const tokenHash = hashToken(token);
     const session = await pool.query(
       'SELECT user_id FROM app_sessions WHERE token_hash=$1 AND expires_at>NOW()',
       [tokenHash]
     );
-    if (!session.rowCount || session.rows[0].user_id !== id) {
+    if (!session.rowCount) {
       return res.status(401).json({ success:false, message:'Your session has expired. Please log in again.' });
     }
-    req.userId = id;
+    const authenticatedId = session.rows[0].user_id;
+    if (requestedId && requestedId !== authenticatedId) {
+      return res.status(401).json({ success:false, message:'Your login session does not match this account. Please log in again.' });
+    }
+    req.userId = authenticatedId;
     req.sessionTokenHash = tokenHash;
     next();
   } catch (e) {
