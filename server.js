@@ -183,6 +183,12 @@ async function initDb() {
     );
     CREATE INDEX IF NOT EXISTS app_dino_redeem_user_idx ON app_dino_redeems(user_id, created_at DESC);
   `);
+  await pool.query(`
+    ALTER TABLE app_dino_redeems ADD COLUMN IF NOT EXISTS asset VARCHAR(10) NOT NULL DEFAULT 'GRAM';
+    ALTER TABLE app_dino_redeems ADD COLUMN IF NOT EXISTS payout_amount NUMERIC(30,12);
+    UPDATE app_dino_redeems SET payout_amount=gram_amount WHERE payout_amount IS NULL;
+    CREATE INDEX IF NOT EXISTS app_dino_redeem_asset_idx ON app_dino_redeems(asset, created_at DESC);
+  `);
   console.log('Redeem app database ready (legacy tables preserved).');
 }
 
@@ -796,19 +802,37 @@ app.post('/api/dino/ad/complete', userOnly, async (req,res)=>{
 });
 
 
-// Dino Rush GRAM point redemptions. 15,000 points = 0.000075 GRAM.
+// Dino Rush multi-currency point redemptions (GRAM, BONK and BNB).
+const DINO_REDEEM_RATES = {
+  GRAM: { per15000: 0.000065, decimals: 6 },
+  BONK: { per15000: 30, decimals: 2 },
+  BNB: { per15000: 0.00000011, decimals: 8 }
+};
+function dinoRedeemAmount(asset, points) {
+  const rate = DINO_REDEEM_RATES[asset];
+  return Number(((points / 15000) * rate.per15000).toFixed(rate.decimals));
+}
 app.get('/api/dino/redeems', userOnly, async (req,res)=>{
   try {
-    const q=await pool.query(`SELECT id,points,gram_amount AS "gramAmount",status,created_at AS "createdAt" FROM app_dino_redeems WHERE user_id=$1 ORDER BY created_at DESC LIMIT 200`,[req.userId]);
+    const q=await pool.query(
+      `SELECT id,asset,wallet_address AS destination,points,
+              payout_amount AS amount,status,created_at AS "createdAt"
+       FROM app_dino_redeems WHERE user_id=$1 ORDER BY created_at DESC LIMIT 200`,
+      [req.userId]
+    );
     res.json({success:true,requests:q.rows});
   } catch(e) { console.error('Dino redeem history',e); res.status(500).json({success:false,message:'Could not load redemption history.'}); }
 });
 app.post('/api/dino/redeems', userOnly, async (req,res)=>{
-  const address=String(req.body.address||'').trim();
+  const asset=String(req.body.asset||'').toUpperCase();
+  const destination=String(req.body.destination||'').trim();
   const points=Number(req.body.points);
-  if(address.length<20 || address.length>160 || !Number.isSafeInteger(points) || points<500000) return res.status(400).json({success:false,message:'Minimum withdrawal is 500,000 points. Enter a valid TON address and point amount.'});
-  const gram=points*0.000000005;
-  if(!Number.isFinite(gram) || gram<=0) return res.status(400).json({success:false,message:'Invalid GRAM amount.'});
+  if(!DINO_REDEEM_RATES[asset]) return res.status(400).json({success:false,message:'Choose a valid redemption currency.'});
+  if(!Number.isSafeInteger(points)||points<500000) return res.status(400).json({success:false,message:'Minimum withdrawal is 500,000 points.'});
+  if(destination.length<3||destination.length>160||(asset==='GRAM'&&destination.length<20))
+    return res.status(400).json({success:false,message:asset==='GRAM'?'Enter a valid TON network address.':'Enter a valid Binance ID.'});
+  const amount=dinoRedeemAmount(asset,points);
+  if(!Number.isFinite(amount)||amount<=0) return res.status(400).json({success:false,message:'Invalid redemption amount.'});
   const client=await pool.connect();
   try {
     await client.query('BEGIN');
@@ -816,17 +840,30 @@ app.post('/api/dino/redeems', userOnly, async (req,res)=>{
     if(!u.rowCount){await client.query('ROLLBACK');return res.status(404).json({success:false,message:'Account not found.'});}
     if(Number(u.rows[0].coins)<points){await client.query('ROLLBACK');return res.status(400).json({success:false,message:'Insufficient points balance.'});}
     await client.query('UPDATE app_users SET coins=coins-$2,updated_at=NOW() WHERE user_id=$1',[req.userId,points]);
-    const q=await client.query(`INSERT INTO app_dino_redeems(user_id,wallet_address,points,gram_amount) VALUES($1,$2,$3,$4) RETURNING id,points,gram_amount AS "gramAmount",status,created_at AS "createdAt"`,[req.userId,address,points,gram.toFixed(12)]);
+    const q=await client.query(
+      `INSERT INTO app_dino_redeems(user_id,wallet_address,points,gram_amount,asset,payout_amount)
+       VALUES($1,$2,$3,$4,$5,$4)
+       RETURNING id,asset,wallet_address AS destination,points,payout_amount AS amount,status,created_at AS "createdAt"`,
+      [req.userId,destination,points,amount.toFixed(12),asset]
+    );
     await client.query('COMMIT');
-    res.json({success:true,request:q.rows[0],message:'Your GRAM redemption request has been submitted.'});
-  } catch(e) { await client.query('ROLLBACK'); console.error('Dino redeem submit',e); res.status(500).json({success:false,message:'Could not submit redemption request.'}); }
-  finally { client.release(); }
+    res.json({success:true,request:q.rows[0],message:'Your '+asset+' redemption request has been submitted.'});
+  } catch(e) {
+    await client.query('ROLLBACK'); console.error('Dino redeem submit',e);
+    res.status(500).json({success:false,message:'Could not submit redemption request.'});
+  } finally { client.release(); }
 });
 app.get('/api/admin/dino/redeems', adminOnly, async (_req,res)=>{
   try {
-    const q=await pool.query(`SELECT r.id,r.wallet_address AS address,r.points,r.gram_amount AS "gramAmount",r.status,r.created_at AS "createdAt" FROM app_dino_redeems r ORDER BY r.created_at DESC LIMIT 1000`);
+    const q=await pool.query(
+      `SELECT r.id,r.asset,r.wallet_address AS destination,r.points,
+              r.payout_amount AS amount,r.status,r.created_at AS "createdAt",
+              u.name,u.email
+       FROM app_dino_redeems r JOIN app_users u ON u.user_id=r.user_id
+       ORDER BY r.created_at DESC LIMIT 1500`
+    );
     res.json({success:true,requests:q.rows});
-  } catch(e) { console.error('Admin Dino redeems',e); res.status(500).json({success:false,message:'Could not load GRAM redemption requests.'}); }
+  } catch(e) { console.error('Admin Dino redeems',e); res.status(500).json({success:false,message:'Could not load redemption requests.'}); }
 });
 app.put('/api/admin/dino/redeems/:id', adminOnly, async (req,res)=>{
   const status=String(req.body.status||'');
@@ -842,8 +879,10 @@ app.put('/api/admin/dino/redeems/:id', adminOnly, async (req,res)=>{
     await client.query('UPDATE app_dino_redeems SET status=$2,updated_at=NOW() WHERE id=$1',[req.params.id,status]);
     await client.query('COMMIT');
     res.json({success:true,message:status==='Rejected'?'Request rejected and points refunded.':'Request status updated.'});
-  } catch(e) { await client.query('ROLLBACK'); console.error('Admin Dino redeem update',e); res.status(500).json({success:false,message:'Could not update redemption status.'}); }
-  finally { client.release(); }
+  } catch(e) {
+    await client.query('ROLLBACK'); console.error('Admin Dino redeem update',e);
+    res.status(500).json({success:false,message:'Could not update redemption status.'});
+  } finally { client.release(); }
 });
 
 initDb().then(()=>app.listen(PORT,()=>console.log(`Redeem & Earn app listening on ${PORT}`))).catch(e=>{console.error('Database startup failed:',e);process.exit(1);});
