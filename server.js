@@ -781,11 +781,8 @@ app.post('/api/dino/ad/start', userOnly, async (req,res)=>{
   try {
     const g=await pool.query('SELECT points,finished_at FROM app_dino_games WHERE id=$1 AND user_id=$2',[gameId,req.userId]);
     if(!g.rowCount || !g.rows[0].finished_at) return res.status(400).json({success:false,message:'Finish a game before opening the reward link.'});
-    const existing=await pool.query('SELECT id,completed_at FROM app_dino_ad_sessions WHERE game_id=$1',[gameId]);
-    if(existing.rowCount){
-      if(existing.rows[0].completed_at) return res.status(409).json({success:false,message:'This game reward has already been claimed.'});
-      return res.json({success:true,adSessionId:existing.rows[0].id,points:Number(g.rows[0].points)});
-    }
+    const existing=await pool.query('SELECT id FROM app_dino_ad_sessions WHERE game_id=$1',[gameId]);
+    if(existing.rowCount) return res.status(409).json({success:false,message:'The reward link for this game has already been started.'});
     const id=crypto.randomUUID();
     await pool.query('INSERT INTO app_dino_ad_sessions(id,game_id,user_id,points) VALUES($1,$2,$3,$4)',[id,gameId,req.userId,g.rows[0].points]);
     res.json({success:true,adSessionId:id,points:Number(g.rows[0].points)});
